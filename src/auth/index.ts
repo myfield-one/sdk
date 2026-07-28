@@ -1,0 +1,17 @@
+export {
+  createInstanceAuthClient,
+  signInstanceChallenge,
+  decryptEncryptedAuthAuthorizationResult,
+  normalizeBucketAccessGrant,
+  bucketResourceId,
+  isValidBucketId,
+  type AuthCapability,
+  type AuthInstance,
+  type AuthCallbackResult,
+  type BucketAccess,
+  type BucketAccessGrant,
+  type CloudSessionCredential,
+  type InstanceAuthClient,
+  type InstanceAuthClientOptions,
+  type InstanceAuthContext,
+} from "./instance.ts";
