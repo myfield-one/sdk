@@ -3,11 +3,49 @@
   "version": "0.9.0",
   "description": "Myfield open SDK: instance auth and end-to-end-encrypted bucket sync for third-party web apps.",
   "license": "Apache-2.0",
-  "type": "module",
-  "exports": {
-    ".": "./src/index.ts"
+  "author": "OPENTECH AI PTE. LTD.",
+  "homepage": "https://github.com/myfield-one/sdk",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/myfield-one/sdk.git"
   },
+  "bugs": {
+    "url": "https://github.com/myfield-one/sdk/issues"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "./dist/index.js",
+  "types": "./types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./types/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/",
+    "src/",
+    "types/",
+    "docs/",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "myfield",
+    "local-first",
+    "encrypted-sync",
+    "sdk"
+  ],
+  "sideEffects": false,
   "scripts": {
+    "build": "esbuild src/index.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=dist/index.js",
+    "prepack": "npm run build",
     "test": "node --experimental-strip-types --test test/*.test.mjs",
     "typecheck": "tsc --noEmit"
   },

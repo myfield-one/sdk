@@ -1,6 +1,6 @@
 # @myfield/sdk
 
-Myfield open SDK for third-party web apps: local-first object storage,
+Myfield SDK for third-party web apps: local-first object storage,
 end-to-end-encrypted sync, and internal Myfield authorization.
 
 The mental model: a bucket is a local-first **end-to-end-encrypted object KV
@@ -86,14 +86,8 @@ deployment host rules. The SDK uses `bucketAccessGrant.resourceId` as the
 remote sync resource id, with `envelope.bucketId` treated as optional
 compatibility metadata.
 
-Service work still needed before public release:
+Deferred service work after this preview release:
 
-- Auth-managed opaque alias bucket allocation for newly created buckets.
-  Current SDK/callback code can consume an alias `bucketAccessGrant.resourceId`;
-  auth still needs the durable original-to-alias bucket binding and migration
-  policy.
-- Worker sync authorization based on the grant alias resource id, including
-  tests where original and alias bucket ids differ.
 - A bucket-scoped hibernatable WebSocket feed under the resource API root.
   SSE remains compatibility/development-only; SDK fallback is
   timer/index-diff sync.
@@ -122,6 +116,7 @@ monorepo workspace (standalone lockfile) so it can be extracted cleanly.
 
 ```sh
 pnpm install --ignore-workspace
+npm run build
 npm test          # node --test (contract layer, mocked relay/auth)
 npm run typecheck # tsc --noEmit
 ```
