@@ -218,10 +218,20 @@ function createBucketFacade(deps: BucketDeps): Bucket {
     }
   }
 
+  // syncAuto pulls by diffing index entry values, so every write must change
+  // this entry. Millisecond `updatedAt` alone repeats within a millisecond and
+  // would hide the second write; `rev` is strictly increasing.
+  let lastIndexRev = 0;
   async function upsertIndexEntry(objectId: string, deleted: boolean): Promise<void> {
     const c = await ensureClient();
+    const now = Date.now();
+    lastIndexRev = Math.max(lastIndexRev + 1, now);
     await c.setFields(INDEX_OBJECT_ID, {
-      [objectId]: { updatedAt: new Date().toISOString(), ...(deleted ? { deleted: true } : {}) },
+      [objectId]: {
+        updatedAt: new Date(now).toISOString(),
+        rev: lastIndexRev,
+        ...(deleted ? { deleted: true } : {}),
+      },
     });
   }
 
