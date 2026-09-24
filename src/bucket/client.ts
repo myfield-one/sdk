@@ -12,6 +12,7 @@ import {
   emptyLwwMapDoc,
   encodePayloadDoc,
   lwwMapDocsEqual,
+  lwwMapLatestTs,
   lwwMapValues,
   LwwClock,
   mergeLwwMapDocs,
@@ -29,6 +30,14 @@ export type BucketTransportLike = {
   pullHead(wireObjectId: string): Promise<TransportHeadResult>;
   pullPayload(wireObjectId: string, versionId: string): Promise<TransportPayloadResult>;
   push(wireObjectId: string, plaintext: Uint8Array, expectedHeadVersionId: string | null): Promise<TransportPushResult>;
+  listHeads?(): Promise<Map<string, string>>;
+};
+
+export type ChangeSource = "local" | "remote";
+
+export type SyncPassOptions = {
+  skipWireIds?: Iterable<string>;
+  resolveUnknown?: (wireObjectId: string, versionId: string) => Promise<string | null>;
 };
 
 export type BucketClientOptions = {
@@ -40,7 +49,9 @@ export type BucketClientOptions = {
   mergeStrategyFor?: (appObjectId: string) => MergeStrategy;
   maxCasAttempts?: number;
   pushDebounceMs?: number;
-  onChange?: (appObjectId: string) => void;
+  localOnlyObjectIds?: Iterable<string>;
+  validateRemote?: (appObjectId: string, doc: PayloadDoc) => void;
+  onChange?: (appObjectId: string, source: ChangeSource) => void;
   onSyncError?: (appObjectId: string | null, error: unknown) => void;
 };
 
@@ -66,13 +77,17 @@ export class BucketClient {
   private readonly maxCasAttempts: number;
   private readonly pushDebounceMs: number;
   private readonly maxEncodedObjectBytes = DEFAULT_MAX_ENCODED_OBJECT_BYTES;
-  private readonly onChange?: (appObjectId: string) => void;
+  private readonly localOnly: Set<string>;
+  private readonly validateRemote?: (appObjectId: string, doc: PayloadDoc) => void;
+  private readonly onChange?: (appObjectId: string, source: ChangeSource) => void;
   private readonly onSyncError?: (appObjectId: string | null, error: unknown) => void;
   private readonly clock = new LwwClock();
   private readonly inFlightSync = new Map<string, Promise<boolean>>();
   private readonly objectLocks = new Map<string, Promise<void>>();
   private readonly pendingPushTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly watched = new Set<string>();
+  // Avoids re-downloading an unresolvable object until its head changes.
+  private readonly unresolved = new Map<string, string>();
   private triggerCleanup: (() => void) | null = null;
   private disposed = false;
 
@@ -85,6 +100,8 @@ export class BucketClient {
     this.mergeStrategyFor = options.mergeStrategyFor || (() => ({ kind: "lww-map" }));
     this.maxCasAttempts = options.maxCasAttempts ?? DEFAULT_MAX_CAS_ATTEMPTS;
     this.pushDebounceMs = options.pushDebounceMs ?? DEFAULT_PUSH_DEBOUNCE_MS;
+    this.localOnly = new Set(options.localOnlyObjectIds || []);
+    this.validateRemote = options.validateRemote;
     this.onChange = options.onChange;
     this.onSyncError = options.onSyncError;
   }
@@ -101,6 +118,11 @@ export class BucketClient {
     const record = await this.readRecord(appObjectId);
     if (!record || record.doc.t !== "opaque") return null;
     return record.doc.data;
+  }
+
+  async lastModified(appObjectId: string): Promise<number | null> {
+    const record = await this.readRecord(appObjectId);
+    return record && record.doc.t === "lww-map" ? lwwMapLatestTs(record.doc) : null;
   }
 
   async knownObjectIds(): Promise<string[]> {
@@ -142,7 +164,7 @@ export class BucketClient {
         dirty: true,
       });
       this.schedulePush(appObjectId);
-      this.onChange?.(appObjectId);
+      this.onChange?.(appObjectId, "local");
       return lwwMapValues(nextDoc);
     });
   }
@@ -159,7 +181,7 @@ export class BucketClient {
         dirty: true,
       });
       this.schedulePush(appObjectId);
-      this.onChange?.(appObjectId);
+      this.onChange?.(appObjectId, "local");
     });
   }
 
@@ -186,26 +208,47 @@ export class BucketClient {
     await this.syncObjects(ids);
   }
 
-  async syncAuto(options?: { indexObjectId?: string }): Promise<void> {
-    const indexObjectId = options?.indexObjectId;
-    const dirtyIdsBefore = await this.dirtyObjectIds();
-    const changedIds = new Set<string>();
-    if (indexObjectId) {
-      const before = await this.indexFields(indexObjectId);
-      const beforeRecord = await this.readRecord(indexObjectId);
-      const changed = await this.syncObject(indexObjectId);
-      const after = await this.indexFields(indexObjectId);
-      const afterRecord = await this.readRecord(indexObjectId);
-      if (changed) {
-        for (const id of diffIndexObjectIds(before, after)) changedIds.add(id);
-      }
-      if (!changed && beforeRecord && beforeRecord.remoteVersionId !== afterRecord?.remoteVersionId) {
-        for (const id of Object.keys(after)) changedIds.add(id);
+  async syncPass(options: SyncPassOptions = {}): Promise<void> {
+    if (!this.transport.listHeads) throw new Error("transport does not list current heads");
+    const heads = await this.transport.listHeads();
+    for (const wireObjectId of options.skipWireIds || []) heads.delete(wireObjectId);
+    const known = new Map<string, string>();
+    const ids = new Set([...this.watched].filter((id) => !this.localOnly.has(id)));
+    for (const id of await this.knownObjectIds()) {
+      if (this.localOnly.has(id)) continue;
+      const record = await this.readRecord(id);
+      if (!record) continue;
+      const wireObjectId = await this.wireId(id);
+      known.set(wireObjectId, id);
+      const head = heads.get(wireObjectId);
+      if (record.dirty || head === undefined || head !== record.remoteVersionId) ids.add(id);
+    }
+    for (const [wireObjectId, versionId] of heads) {
+      if (known.has(wireObjectId) || !options.resolveUnknown || this.unresolved.get(wireObjectId) === versionId) continue;
+      try {
+        const id = await options.resolveUnknown(wireObjectId, versionId);
+        if (id && !this.localOnly.has(id) && (await this.wireId(id)) === wireObjectId) {
+          this.unresolved.delete(wireObjectId);
+          ids.add(id);
+        } else {
+          this.unresolved.set(wireObjectId, versionId);
+        }
+      } catch (error) {
+        this.onSyncError?.(null, error);
       }
     }
-    const ids = new Set([...this.watched, ...dirtyIdsBefore, ...changedIds]);
-    if (indexObjectId) ids.delete(indexObjectId);
     await this.syncObjects(ids);
+  }
+
+  async pullDoc(wireObjectId: string, versionId: string): Promise<PayloadDoc | null> {
+    const payload = await this.transport.pullPayload(wireObjectId, versionId);
+    return payload.found ? decodePayloadDoc(payload.plaintext) : null;
+  }
+
+  async pullRemoteDoc(appObjectId: string): Promise<PayloadDoc | null> {
+    const wireObjectId = await this.wireId(appObjectId);
+    const head = await this.transport.pullHead(wireObjectId);
+    return head.found ? this.pullDoc(wireObjectId, head.versionId) : null;
   }
 
   watch(appObjectIds: Iterable<string>): void {
@@ -215,10 +258,11 @@ export class BucketClient {
   // Sync-trigger model: launch (start itself) and a timer fallback.
   // Browser/app lifecycle triggers are owned by the app; post-write pushes
   // are scheduled by setFields/setData.
-  start(options?: { intervalMs?: number; indexObjectId?: string }): void {
+  start(options: { intervalMs?: number; run: () => Promise<void> }): void {
     if (this.triggerCleanup || this.disposed) return;
-    const kick = () => void this.syncAuto(options).catch((error) => this.onSyncError?.(null, error));
-    const intervalMs = options?.intervalMs ?? DEFAULT_SYNC_INTERVAL_MS;
+    const run = options.run;
+    const kick = () => void run().catch((error) => this.onSyncError?.(null, error));
+    const intervalMs = options.intervalMs ?? DEFAULT_SYNC_INTERVAL_MS;
     const timer = intervalMs > 0 ? setInterval(kick, intervalMs) : null;
     this.triggerCleanup = () => {
       if (timer) clearInterval(timer);
@@ -253,7 +297,7 @@ export class BucketClient {
   // ---- internals ---------------------------------------------------------
 
   private schedulePush(appObjectId: string): void {
-    if (this.disposed) return;
+    if (this.disposed || this.localOnly.has(appObjectId)) return;
     const existing = this.pendingPushTimers.get(appObjectId);
     if (existing) clearTimeout(existing);
     this.pendingPushTimers.set(
@@ -266,6 +310,7 @@ export class BucketClient {
   }
 
   private async performSync(appObjectId: string): Promise<boolean> {
+    if (this.localOnly.has(appObjectId)) return false;
     const wireObjectId = await this.wireId(appObjectId);
     let remoteChangedLocal = false;
     for (let attempt = 0; attempt < this.maxCasAttempts; attempt += 1) {
@@ -293,6 +338,7 @@ export class BucketClient {
         const payload = await this.transport.pullPayload(wireObjectId, head.versionId);
         if (!payload.found) return "retry";
         const remoteDoc = decodePayloadDoc(payload.plaintext);
+        this.validateRemote?.(appObjectId, remoteDoc);
         const merged = record ? this.merge(appObjectId, record.doc, remoteDoc) : remoteDoc;
         const localViewChanged = !record || !docsEqual(merged, record.doc);
         const remoteNeedsUpdate = !docsEqual(merged, remoteDoc);
@@ -303,7 +349,7 @@ export class BucketClient {
           await this.writeRecord(appObjectId, { v: 1, doc: merged, remoteVersionId: head.versionId, dirty: false });
           if (localViewChanged) {
             remoteChangedLocal = true;
-            this.onChange?.(appObjectId);
+            this.onChange?.(appObjectId, "remote");
           }
           return remoteChangedLocal;
         }
@@ -313,7 +359,7 @@ export class BucketClient {
           await this.writeRecord(appObjectId, { v: 1, doc: merged, remoteVersionId: result.versionId, dirty: false });
           if (localViewChanged) {
             remoteChangedLocal = true;
-            this.onChange?.(appObjectId);
+            this.onChange?.(appObjectId, "remote");
           }
           return remoteChangedLocal;
         }
@@ -342,15 +388,11 @@ export class BucketClient {
   async dirtyObjectIds(): Promise<string[]> {
     const ids: string[] = [];
     for (const id of await this.knownObjectIds()) {
+      if (this.localOnly.has(id)) continue;
       const record = await this.readRecord(id);
       if (record?.dirty) ids.push(id);
     }
     return ids;
-  }
-
-  private async indexFields(indexObjectId: string): Promise<Record<string, unknown>> {
-    const record = await this.readRecord(indexObjectId);
-    return record?.doc.t === "lww-map" ? lwwMapValues(record.doc) : {};
   }
 
   private async readRecord(appObjectId: string): Promise<LocalObjectRecord | null> {
@@ -377,7 +419,3 @@ function docsEqual(a: PayloadDoc, b: PayloadDoc): boolean {
   return false;
 }
 
-function diffIndexObjectIds(before: Record<string, unknown>, after: Record<string, unknown>): string[] {
-  const ids = new Set([...Object.keys(before), ...Object.keys(after)]);
-  return [...ids].filter((id) => JSON.stringify(before[id]) !== JSON.stringify(after[id]));
-}

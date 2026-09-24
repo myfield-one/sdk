@@ -6,6 +6,7 @@
 // Document body:
 //   { t: "lww-map", fields: { name: { v, ts, actor } }, tombstones: { name: { ts, actor } } }
 //   or { t: "opaque", data: <arbitrary JSON> } for custom merge strategies.
+// Unknown top-level and entry keys are kept (BUCKET-SPEC merge steps 4-5).
 // Binary typed field values are represented in the JSON header as part references
 // and carried as raw bytes in the binary parts section.
 
@@ -23,14 +24,17 @@ const HEADER_LENGTH_BYTES = 4;
 const PART_LENGTH_BYTES = 4;
 const BINARY_PART_MARKER = "binary-part-v1";
 
-export type LwwFieldEntry = { v: unknown; ts: number; actor: string };
-export type LwwTombstone = { ts: number; actor: string };
+export type LwwFieldEntry = { v: unknown; ts: number; actor: string; [extra: string]: unknown };
+export type LwwTombstone = { ts: number; actor: string; [extra: string]: unknown };
 
 export type LwwMapDoc = {
   t: "lww-map";
   fields: Record<string, LwwFieldEntry>;
   tombstones: Record<string, LwwTombstone>;
+  ext?: Record<string, unknown>;
 };
+
+const LWW_MAP_KEYS = new Set(["t", "fields", "tombstones"]);
 
 export type OpaqueDoc = { t: "opaque"; data: unknown };
 
@@ -42,7 +46,8 @@ export function emptyLwwMapDoc(): LwwMapDoc {
 
 export function encodePayloadDoc(doc: PayloadDoc): Uint8Array {
   const parts: Uint8Array[] = [];
-  const header = utf8Encode(JSON.stringify(encodeHeaderValue(doc, parts)));
+  const body = doc.t === "lww-map" ? { ...(doc.ext || {}), t: doc.t, fields: doc.fields, tombstones: doc.tombstones } : doc;
+  const header = utf8Encode(JSON.stringify(encodeHeaderValue(body, parts)));
   let totalLength = 1 + HEADER_LENGTH_BYTES + header.byteLength;
   for (const part of parts) totalLength += PART_LENGTH_BYTES + part.byteLength;
   const out = new Uint8Array(totalLength);
@@ -93,7 +98,13 @@ function parsePayloadDoc(parsed: unknown): PayloadDoc {
     for (const entry of Object.values(doc.tombstones)) {
       if (!isLwwTombstone(entry)) throw new Error("invalid lww-map tombstone");
     }
-    return { t: "lww-map", fields: doc.fields as Record<string, LwwFieldEntry>, tombstones: doc.tombstones as Record<string, LwwTombstone> };
+    const ext = Object.fromEntries(Object.entries(doc).filter(([key]) => !LWW_MAP_KEYS.has(key)));
+    return {
+      t: "lww-map",
+      fields: doc.fields as Record<string, LwwFieldEntry>,
+      tombstones: doc.tombstones as Record<string, LwwTombstone>,
+      ...(Object.keys(ext).length ? { ext } : {}),
+    };
   }
   if (docRoot?.t === "opaque") return { t: "opaque", data: (docRoot as OpaqueDoc).data };
   throw new Error("unknown payload doc type");
@@ -106,13 +117,20 @@ function wins(aTs: number, aActor: string, bTs: number, bActor: string): boolean
   return aActor > bActor;
 }
 
-// A well-behaved actor never issues two different values under the same
-// (ts, actor), but merge must stay deterministic even for malformed input:
-// on a full (ts, actor) tie the serialized value breaks the tie.
+// Full (ts, actor) ties (malformed input, or an older SDK that dropped extra
+// keys) fall back to the value, then the whole entry, to stay deterministic.
 function fieldEntryWins(a: LwwFieldEntry, b: LwwFieldEntry): boolean {
   if (a.ts !== b.ts) return a.ts > b.ts;
   if (a.actor !== b.actor) return a.actor > b.actor;
-  return JSON.stringify(fieldValueToCanonicalJson(a.v)) > JSON.stringify(fieldValueToCanonicalJson(b.v));
+  const aValue = JSON.stringify(fieldValueToCanonicalJson(a.v));
+  const bValue = JSON.stringify(fieldValueToCanonicalJson(b.v));
+  if (aValue !== bValue) return aValue > bValue;
+  return canonicalJson(a) > canonicalJson(b);
+}
+
+function tombstoneWins(a: LwwTombstone, b: LwwTombstone): boolean {
+  if (a.ts !== b.ts || a.actor !== b.actor) return wins(a.ts, a.actor, b.ts, b.actor);
+  return canonicalJson(a) > canonicalJson(b);
 }
 
 // State-based LWW-Map merge: commutative, associative, idempotent. A field
@@ -124,36 +142,66 @@ export function mergeLwwMapDocs(a: LwwMapDoc, b: LwwMapDoc): LwwMapDoc {
   for (const source of [a.tombstones, b.tombstones]) {
     for (const [name, stone] of Object.entries(source)) {
       const existing = tombstones[name];
-      if (!existing || wins(stone.ts, stone.actor, existing.ts, existing.actor)) tombstones[name] = { ts: stone.ts, actor: stone.actor };
+      if (!existing || tombstoneWins(stone, existing)) tombstones[name] = { ...stone };
     }
   }
   const fields: Record<string, LwwFieldEntry> = {};
   for (const source of [a.fields, b.fields]) {
     for (const [name, entry] of Object.entries(source)) {
       const existing = fields[name];
-      if (!existing || fieldEntryWins(entry, existing)) fields[name] = { v: entry.v, ts: entry.ts, actor: entry.actor };
+      if (!existing || fieldEntryWins(entry, existing)) fields[name] = { ...entry };
     }
   }
   for (const [name, stone] of Object.entries(tombstones)) {
     const entry = fields[name];
     if (entry && !wins(entry.ts, entry.actor, stone.ts, stone.actor)) delete fields[name];
   }
-  return { t: "lww-map", fields, tombstones };
+  const ext = mergeExt(a.ext, b.ext);
+  return { t: "lww-map", fields, tombstones, ...(ext ? { ext } : {}) };
+}
+
+function mergeExt(a: Record<string, unknown> | undefined, b: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!a && !b) return undefined;
+  const merged: Record<string, unknown> = { ...(a || {}) };
+  for (const [key, value] of Object.entries(b || {})) {
+    if (!(key in merged) || canonicalJson(value) > canonicalJson(merged[key])) merged[key] = value;
+  }
+  return Object.keys(merged).length ? merged : undefined;
+}
+
+function canonicalJson(value: unknown): string {
+  return stableStringify(fieldValueToCanonicalJson(value));
+}
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableStringify(item)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
 }
 
 export function lwwMapDocsEqual(a: LwwMapDoc, b: LwwMapDoc): boolean {
-  return JSON.stringify(canonicalLwwMapDoc(a)) === JSON.stringify(canonicalLwwMapDoc(b));
+  return canonicalJson(canonicalLwwMapDoc(a)) === canonicalJson(canonicalLwwMapDoc(b));
 }
 
 function canonicalLwwMapDoc(doc: LwwMapDoc): unknown {
   return {
-    fields: Object.fromEntries(
-      Object.entries(doc.fields)
-        .sort(([a], [b]) => (a < b ? -1 : 1))
-        .map(([name, entry]) => [name, { ...entry, v: fieldValueToCanonicalJson(entry.v) }])
-    ),
-    tombstones: Object.fromEntries(Object.entries(doc.tombstones).sort(([a], [b]) => (a < b ? -1 : 1))),
+    fields: Object.fromEntries(Object.entries(doc.fields).map(([name, entry]) => [name, { ...entry, v: fieldValueToCanonicalJson(entry.v) }])),
+    tombstones: doc.tombstones,
+    ext: doc.ext || {},
   };
+}
+
+export function lwwMapLatestTs(doc: LwwMapDoc): number | null {
+  let latest: number | null = null;
+  for (const entry of [...Object.values(doc.fields), ...Object.values(doc.tombstones)]) {
+    if (latest === null || entry.ts > latest) latest = entry.ts;
+  }
+  return latest;
 }
 
 // Plain field view with tombstones and metadata hidden.
@@ -189,6 +237,7 @@ export function applyLwwMapUpdates(doc: LwwMapDoc, updates: Record<string, unkno
     t: "lww-map",
     fields: { ...doc.fields },
     tombstones: { ...doc.tombstones },
+    ...(doc.ext ? { ext: { ...doc.ext } } : {}),
   };
   for (const [name, value] of Object.entries(updates)) {
     const ts = clock.next();

@@ -18,7 +18,9 @@ import test from "node:test";
 
 import { createInstance } from "../src/index.ts";
 import { isBucketBinaryValue } from "../src/bucket/binary.ts";
-import { createMockRelay } from "./helpers.mjs";
+import { BucketClient } from "../src/bucket/client.ts";
+import { decodePayloadDoc, encodePayloadDoc } from "../src/bucket/format.ts";
+import { createMemoryStorage, createMockRelay } from "./helpers.mjs";
 
 let seq = 0;
 function makeBucket(relay, { namespace } = {}) {
@@ -242,9 +244,14 @@ test("field names and object ids starting with ~ are rejected", async () => {
   await assert.rejects(() => bucket.update("doc", { "~x": 1 }));
 });
 
-// ---- internal index: list + cold start -------------------------------------
+// ---- relay listing: list + cold start --------------------------------------
 
-test("fresh device discovers objects through the internal index", async () => {
+function remoteFields(relay, wireId) {
+  const entry = relay.objects.get(wireId);
+  return entry ? decodePayloadDoc(entry.plaintext).fields : null;
+}
+
+test("fresh device discovers objects through the relay listing", async () => {
   const relay = createMockRelay();
   const seed = makeBucket(relay);
   await seed.put("note:1", { body: "one" });
@@ -260,42 +267,158 @@ test("fresh device discovers objects through the internal index", async () => {
   assert.deepEqual(await fresh.get("note:2"), { body: "two" });
 });
 
-test("manual sync uses index diff instead of sweeping every known object", async () => {
+test("a no-change sync pass lists heads without pulling objects", async () => {
   const relay = createMockRelay();
   const bucket = makeBucket(relay);
   await bucket.put("note:1", { body: "clean" });
   await bucket.sync();
 
   const baseTransport = relay.transport();
-  const calls = [];
+  const calls = { listHeads: 0, pullHead: 0 };
   bucket.__bindTestTransport({
     ...baseTransport,
+    async listHeads() {
+      calls.listHeads += 1;
+      return baseTransport.listHeads();
+    },
     async pullHead(wireId) {
-      calls.push(wireId);
+      calls.pullHead += 1;
       return baseTransport.pullHead(wireId);
     },
   });
 
   await bucket.sync();
 
-  assert.equal(calls.length, 1, `expected only the internal index head request, got ${calls.length}`);
+  assert.deepEqual(calls, { listHeads: 1, pullHead: 0 });
+});
+
+test("sync never pushes the ~index object", async () => {
+  const relay = createMockRelay();
+  const bucket = makeBucket(relay);
+  await bucket.put("note:1", { body: "one" });
+  await bucket.update("note:2", { body: "two" });
+  await bucket.delete("note:1");
+  await bucket.sync();
+  assert.deepEqual([...relay.objects.keys()].sort(), ["note:1", "note:2"]);
+  assert.equal((await bucket.list({ includeDeleted: true })).length, 2, "local index still backs list()");
+});
+
+test("every written object carries ~id, hidden from the app", async () => {
+  const relay = createMockRelay();
+  const bucket = makeBucket(relay);
+  await bucket.update("note:1", { body: "one" });
+  await bucket.delete("note:2");
+  await bucket.sync();
+  assert.equal(remoteFields(relay, "note:1")["~id"].v, "note:1");
+  assert.equal(remoteFields(relay, "note:2")["~id"].v, "note:2");
+  assert.deepEqual(await bucket.get("note:1"), { body: "one" });
+});
+
+test("empty writes to a missing object stay a no-op", async () => {
+  const bucket = makeBucket(null);
+  await bucket.update("note:1", {});
+  await bucket.put("note:2", {});
+  assert.deepEqual(await bucket.list(), []);
 });
 
 // The test seam binds with identity wire ids (blinding has its own unit
 // tests), so app object ids are directly addressable on the mock relay.
-test("dangling index entries (evicted objects) read as absent, not as errors", async () => {
+test("evicted objects are absent on a fresh device, not an error", async () => {
   const relay = createMockRelay();
   const seed = makeBucket(relay);
   await seed.put("note:1", { body: "one" });
   await seed.sync();
-  relay.evict("note:1"); // evict the note, keep the internal index
+  relay.evict("note:1");
 
   const fresh = makeBucket(relay);
   await fresh.sync();
-  const rows = await fresh.list();
-  assert.equal(rows.length, 1, "list entry still listed");
-  assert.equal(rows[0].id, "note:1");
-  assert.equal(await fresh.get("note:1"), null, "missing object reads as absent");
+  assert.deepEqual(await fresh.list(), []);
+  assert.equal(await fresh.get("note:1"), null);
+});
+
+test("a remote object whose ~id does not match is not adopted", async () => {
+  const relay = createMockRelay();
+  const a = makeBucket(relay);
+  await a.put("note:1", { body: "mine" });
+  await a.sync();
+  const forged = decodePayloadDoc(relay.objects.get("note:1").plaintext);
+  forged.fields["~id"] = { v: "note:other", ts: Date.now() + 1000, actor: "z" };
+  forged.fields.body = { v: "forged", ts: Date.now() + 1000, actor: "z" };
+  relay.objects.set("note:1", { versionId: crypto.randomUUID(), plaintext: encodePayloadDoc(forged) });
+
+  const details = [];
+  a.on("state", (_state, detail) => details.push(detail));
+  await a.sync();
+  assert.deepEqual(await a.get("note:1"), { body: "mine" }, "known object keeps local state");
+  assert.ok(details.some((detail) => /object id mismatch/.test(detail)));
+
+  const fresh = makeBucket(relay);
+  await fresh.sync();
+  assert.deepEqual(await fresh.list(), [], "unknown object with a foreign ~id is skipped");
+});
+
+// ---- 0.9.0 compatibility ----------------------------------------------------
+
+// Writes the way SDK 0.9.0 did: no ~id, and every change also pushes ~index.
+function createLegacyDevice(relay) {
+  const client = new BucketClient({ transport: relay.transport(), storage: createMemoryStorage(), actorId: "legacy", pushDebounceMs: 60_000 });
+  let rev = 0;
+  return {
+    client,
+    async write(objectId, fields) {
+      await client.setFields(objectId, fields);
+      rev = Math.max(rev + 1, Date.now());
+      await client.setFields("~index", { [objectId]: { updatedAt: new Date().toISOString(), rev } });
+      await client.flush(objectId);
+      await client.flush("~index");
+    },
+  };
+}
+
+test("a bucket written by 0.9.0 is restored and upgraded with ~id", async () => {
+  const relay = createMockRelay();
+  const legacy = createLegacyDevice(relay);
+  await legacy.write("note:1", { body: "old" });
+  const legacyIndexVersion = relay.objects.get("~index").versionId;
+
+  const fresh = makeBucket(relay);
+  await fresh.sync();
+  assert.deepEqual(await fresh.get("note:1"), { body: "old" });
+  assert.deepEqual((await fresh.list()).map((row) => row.id), ["note:1"]);
+  assert.equal(remoteFields(relay, "note:1")["~id"].v, "note:1", "upgraded in place");
+  assert.equal(relay.objects.get("~index").versionId, legacyIndexVersion, "legacy ~index is not pushed");
+});
+
+test("an open 0.9.0 device keeps pushing edits and new objects", async () => {
+  const relay = createMockRelay();
+  const legacy = createLegacyDevice(relay);
+  await legacy.write("note:1", { body: "v1" });
+  const current = makeBucket(relay);
+  await current.sync();
+
+  await legacy.client.syncObject("note:1");
+  await legacy.write("note:1", { body: "v2" });
+  await legacy.write("note:2", { body: "new" });
+  await current.sync();
+  assert.deepEqual(await current.get("note:1"), { body: "v2" });
+  assert.deepEqual(await current.get("note:2"), { body: "new" }, "resolved through the legacy ~index");
+  assert.equal(remoteFields(relay, "note:1")["~id"].v, "note:1", "legacy edits keep ~id");
+});
+
+test("~id dropped by a 0.9.0 put() is written back", async () => {
+  const relay = createMockRelay();
+  const current = makeBucket(relay);
+  await current.put("note:1", { body: "one" });
+  await current.sync();
+
+  const legacy = createLegacyDevice(relay);
+  await legacy.client.syncObject("note:1");
+  await legacy.write("note:1", { "~id": undefined, body: "rewritten" });
+  assert.equal(remoteFields(relay, "note:1")["~id"], undefined);
+
+  await current.sync();
+  assert.deepEqual(await current.get("note:1"), { body: "rewritten" });
+  assert.equal(remoteFields(relay, "note:1")["~id"].v, "note:1");
 });
 
 // ---- eviction healing -------------------------------------------------------
@@ -308,7 +431,7 @@ test("relay loss is healed from local state on next sync", async () => {
   for (const wireId of [...relay.objects.keys()]) relay.evict(wireId);
   assert.equal(relay.objects.size, 0);
   await a.sync();
-  assert.ok(relay.objects.size >= 2, "index and object re-created");
+  assert.deepEqual([...relay.objects.keys()], ["note:1"], "object re-created, no ~index");
   const fresh = makeBucket(relay);
   await fresh.sync();
   assert.deepEqual(await fresh.get("note:1"), { body: "survives" });

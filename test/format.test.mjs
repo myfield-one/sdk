@@ -2,15 +2,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  LwwClock,
+  PAYLOAD_FORMAT_VERSION,
   applyLwwMapUpdates,
   decodePayloadDoc,
   emptyLwwMapDoc,
   encodePayloadDoc,
   lwwMapDocsEqual,
+  lwwMapLatestTs,
   lwwMapValues,
-  LwwClock,
   mergeLwwMapDocs,
-  PAYLOAD_FORMAT_VERSION,
 } from "../src/bucket/format.ts";
 import { canonicalizeFieldMap, createBucketBinaryValue, isBucketBinaryValue } from "../src/bucket/binary.ts";
 
@@ -145,4 +146,61 @@ test("opaque payload roundtrip", () => {
   const decoded = decodePayloadDoc(bytes);
   assert.equal(decoded.t, "opaque");
   assert.deepEqual(decoded.data, { any: ["shape", 1] });
+});
+
+// Unknown keys (BUCKET-SPEC merge steps 4-5) survive decode, merge and
+// re-encode, so a newer SDK's additions are not stripped by this one.
+test("unknown top-level keys and entry extras survive decode, merge and encode", () => {
+  const withExtras = {
+    t: "lww-map",
+    fields: { body: { v: "hi", ts: 5, actor: "b", base: "v1" } },
+    tombstones: { gone: { ts: 3, actor: "b", why: "moved" } },
+    future: { v: 1, ts: 9, actor: "b" },
+  };
+  const bytes = new Uint8Array([1, 0, 0, 0, 0]);
+  const header = new TextEncoder().encode(JSON.stringify(withExtras));
+  const raw = new Uint8Array(5 + header.byteLength);
+  raw.set(bytes);
+  raw[1] = (header.byteLength >>> 24) & 255;
+  raw[2] = (header.byteLength >>> 16) & 255;
+  raw[3] = (header.byteLength >>> 8) & 255;
+  raw[4] = header.byteLength & 255;
+  raw.set(header, 5);
+
+  const decoded = decodePayloadDoc(raw);
+  assert.deepEqual(decoded.ext, { future: { v: 1, ts: 9, actor: "b" } });
+  const older = { t: "lww-map", fields: { body: { v: "old", ts: 1, actor: "a" } }, tombstones: {} };
+  const merged = mergeLwwMapDocs(older, decoded);
+  assert.equal(merged.fields.body.base, "v1", "extra entry key travels with the winner");
+  assert.equal(merged.tombstones.gone.why, "moved");
+  const roundTrip = decodePayloadDoc(encodePayloadDoc(merged));
+  assert.deepEqual(roundTrip, merged);
+  assert.equal(JSON.parse(new TextDecoder().decode(encodePayloadDoc(merged).subarray(5))).future.ts, 9);
+});
+
+test("conflicting unknown top-level keys converge in either merge order", () => {
+  const a = { t: "lww-map", fields: {}, tombstones: {}, ext: { future: { v: "a" }, onlyA: 1 } };
+  const b = { t: "lww-map", fields: {}, tombstones: {}, ext: { future: { v: "b" }, onlyB: 2 } };
+  const ab = mergeLwwMapDocs(a, b);
+  const ba = mergeLwwMapDocs(b, a);
+  assert.deepEqual(ab.ext, { future: { v: "b" }, onlyA: 1, onlyB: 2 });
+  assert.ok(lwwMapDocsEqual(ab, ba));
+  assert.ok(lwwMapDocsEqual(mergeLwwMapDocs(ab, a), ab), "idempotent");
+});
+
+test("docs that differ only in unknown keys are not equal", () => {
+  const plain = { t: "lww-map", fields: {}, tombstones: {} };
+  assert.equal(lwwMapDocsEqual(plain, { ...plain, ext: { future: 1 } }), false);
+  assert.equal(lwwMapLatestTs(plain), null);
+  assert.equal(lwwMapLatestTs({ t: "lww-map", fields: { a: { v: 1, ts: 4, actor: "x" } }, tombstones: { b: { ts: 7, actor: "x" } } }), 7);
+});
+
+test("entries tied on (ts, actor, v) but differing in extras merge the same in either order", () => {
+  const withExtra = doc({ body: { v: "x", ts: 5, actor: "a", base: "v1" } }, { gone: { ts: 3, actor: "a", why: "moved" } });
+  const stripped = doc({ body: { v: "x", ts: 5, actor: "a" } }, { gone: { ts: 3, actor: "a" } });
+  const ab = mergeLwwMapDocs(withExtra, stripped);
+  const ba = mergeLwwMapDocs(stripped, withExtra);
+  assert.ok(lwwMapDocsEqual(ab, ba));
+  assert.deepEqual(ab.fields.body, ba.fields.body);
+  assert.deepEqual(ab.tombstones.gone, ba.tombstones.gone);
 });

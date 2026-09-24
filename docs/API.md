@@ -133,7 +133,8 @@ application-owned and is not a public SDK API concept.
 - `get(id)` returns the local object or `null` when absent, deleted, or not
   locally available.
 - `list()` returns the local known-object index, newest first. It is not a
-  query/search API.
+  query/search API. Objects from other devices appear once a sync pulls
+  them; their `change` event fires after `list()` includes them.
 - Object ids and field names starting with `~` are reserved and rejected.
 
 ## Connection API

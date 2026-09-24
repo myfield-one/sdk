@@ -5,9 +5,11 @@
 // boundary. `namespace` scopes ALL local persistence (instance keys, auth
 // context, sessions, objects, the internal index) and never reaches the
 // wire; bucket `id` is the app-local authorization label, while sync uses
-// the remote bucket id returned in the grant envelope.
+// the remote bucket id returned in the grant envelope. `~index` is local
+// only; objects carry their app id in `~id` (docs/BUCKET-SPEC.md).
 
-import { BucketClient, type BucketTransportLike } from "./bucket/client.ts";
+import { BucketClient, type BucketTransportLike, type ChangeSource } from "./bucket/client.ts";
+import type { PayloadDoc } from "./bucket/format.ts";
 import {
   canonicalizeFieldValue,
   createBucketBinaryValue,
@@ -29,6 +31,7 @@ import { randomId } from "./internal/encoding.ts";
 const DEFAULT_AUTH_BASE = "https://myfield.one/auth/";
 const DEFAULT_API_BASE = "https://api.myfield.one";
 const INDEX_OBJECT_ID = "~index";
+const ID_FIELD = "~id";
 const DELETED_FIELD = "~deleted";
 const RESERVED_PREFIX = "~";
 
@@ -183,15 +186,21 @@ function createBucketFacade(deps: BucketDeps): Bucket {
             if (!liveTransport) return Promise.reject(new OfflineError());
             return liveTransport.push(wireObjectId, plaintext, expectedHeadVersionId);
           },
+          listHeads() {
+            if (!liveTransport?.listHeads) return Promise.reject(new OfflineError());
+            return liveTransport.listHeads();
+          },
         },
         storage: dataAdapter,
         actorId,
+        localOnlyObjectIds: [INDEX_OBJECT_ID],
+        validateRemote: assertRemoteObjectId,
         wireObjectId: (appObjectId) => {
           if (!liveWireId) return Promise.reject(new OfflineError());
           return liveWireId(appObjectId);
         },
         storagePrefix: `data:${bucketId}`,
-        onChange: emitChange,
+        onChange: onClientChange,
         onSyncError: (objectId, error) => {
           if (error instanceof OfflineError) return;
           // Retryable sync failures surface as state detail without a state
@@ -202,6 +211,36 @@ function createBucketFacade(deps: BucketDeps): Bucket {
       return client;
     })();
     return clientInit;
+  }
+
+  function assertRemoteObjectId(objectId: string, doc: PayloadDoc): void {
+    if (objectId.startsWith(RESERVED_PREFIX) || doc.t !== "lww-map") return;
+    const remoteId = doc.fields[ID_FIELD]?.v;
+    if (remoteId !== undefined && remoteId !== objectId) throw new Error(`object id mismatch for ${objectId}`);
+  }
+
+  // Refresh the index before emitting, so a change handler's list() sees it.
+  const pendingIndexRefreshes = new Set<Promise<void>>();
+  function onClientChange(objectId: string, source: ChangeSource): void {
+    if (objectId.startsWith(RESERVED_PREFIX)) return;
+    if (source === "local") {
+      emitChange(objectId);
+      return;
+    }
+    const refresh = refreshIndexEntry(objectId)
+      .catch((error) => emitState(state, `index update failed (${objectId}): ${formatError(error)}`))
+      .finally(() => {
+        pendingIndexRefreshes.delete(refresh);
+        emitChange(objectId);
+      });
+    pendingIndexRefreshes.add(refresh);
+  }
+
+  async function refreshIndexEntry(objectId: string): Promise<void> {
+    const c = await ensureClient();
+    const raw = await c.getFields(objectId);
+    const latest = await c.lastModified(objectId);
+    await upsertIndexEntry(objectId, raw?.[DELETED_FIELD] === true, latest ?? Date.now());
   }
 
   // ---- local object API ---------------------------------------------------
@@ -218,17 +257,14 @@ function createBucketFacade(deps: BucketDeps): Bucket {
     }
   }
 
-  // syncAuto pulls by diffing index entry values, so every write must change
-  // this entry. Millisecond `updatedAt` alone repeats within a millisecond and
-  // would hide the second write; `rev` is strictly increasing.
+  // `rev` keeps two writes in one millisecond distinct.
   let lastIndexRev = 0;
-  async function upsertIndexEntry(objectId: string, deleted: boolean): Promise<void> {
+  async function upsertIndexEntry(objectId: string, deleted: boolean, updatedAtMs = Date.now()): Promise<void> {
     const c = await ensureClient();
-    const now = Date.now();
-    lastIndexRev = Math.max(lastIndexRev + 1, now);
+    lastIndexRev = Math.max(lastIndexRev + 1, Date.now());
     await c.setFields(INDEX_OBJECT_ID, {
       [objectId]: {
-        updatedAt: new Date(now).toISOString(),
+        updatedAt: new Date(updatedAtMs).toISOString(),
         rev: lastIndexRev,
         ...(deleted ? { deleted: true } : {}),
       },
@@ -257,6 +293,10 @@ function createBucketFacade(deps: BucketDeps): Bucket {
     return changed;
   }
 
+  function withObjectId(updates: Record<string, unknown>, objectId: string, known: Record<string, unknown>): Record<string, unknown> {
+    return known[ID_FIELD] === objectId ? updates : { ...updates, [ID_FIELD]: objectId };
+  }
+
   async function put(objectId: string, object: Record<string, unknown>): Promise<void> {
     assertObjectId(objectId);
     assertFieldNames(object);
@@ -264,11 +304,11 @@ function createBucketFacade(deps: BucketDeps): Bucket {
     const known = (await c.getFields(objectId)) || {};
     const updates: Record<string, unknown> = { ...object };
     for (const name of Object.keys(known)) {
-      if (!(name in object)) updates[name] = undefined; // deletes locally known omitted fields (incl. a live ~deleted marker)
+      if (!(name in object) && name !== ID_FIELD) updates[name] = undefined; // deletes locally known omitted fields (incl. a live ~deleted marker)
     }
     const changed = await dropUnchanged(updates, known);
     if (Object.keys(changed).length === 0) return; // full no-op: do not advance LWW state or the index entry
-    await c.setFields(objectId, changed);
+    await c.setFields(objectId, withObjectId(changed, objectId, known));
     await upsertIndexEntry(objectId, false);
   }
 
@@ -281,7 +321,7 @@ function createBucketFacade(deps: BucketDeps): Bucket {
     if (DELETED_FIELD in known) updates[DELETED_FIELD] = undefined; // update recreates a deleted object
     const changed = await dropUnchanged(updates, known);
     if (Object.keys(changed).length === 0) return;
-    await c.setFields(objectId, changed);
+    await c.setFields(objectId, withObjectId(changed, objectId, known));
     await upsertIndexEntry(objectId, false);
   }
 
@@ -309,7 +349,7 @@ function createBucketFacade(deps: BucketDeps): Bucket {
     for (const name of Object.keys(known)) {
       if (!name.startsWith(RESERVED_PREFIX)) updates[name] = undefined;
     }
-    await c.setFields(objectId, updates);
+    await c.setFields(objectId, withObjectId(updates, objectId, known));
     await upsertIndexEntry(objectId, true);
   }
 
@@ -334,20 +374,52 @@ function createBucketFacade(deps: BucketDeps): Bucket {
 
   async function sync(): Promise<void> {
     if (!liveTransport) throw new NotConnectedError();
+    await runSyncPass();
+  }
+
+  async function runSyncPass(): Promise<void> {
     const c = await ensureClient();
-    const dirtyObjectIds = (await c.dirtyObjectIds()).filter((id) => id !== INDEX_OBJECT_ID && !id.startsWith(RESERVED_PREFIX));
-    await c.syncAuto({ indexObjectId: INDEX_OBJECT_ID });
-    for (const id of dirtyObjectIds) {
+    const wireId = liveWireId;
+    if (!wireId) throw new OfflineError();
+    // 0.9.0 compatibility: skip the remote ~index, but use it to resolve objects without ~id.
+    let legacyIndex: Record<string, unknown> | null | undefined;
+    await c.syncPass({
+      skipWireIds: [await wireId(INDEX_OBJECT_ID)],
+      resolveUnknown: async (wireObjectId, versionId) => {
+        const doc = await c.pullDoc(wireObjectId, versionId);
+        if (!doc || doc.t !== "lww-map") return null;
+        const id = doc.fields[ID_FIELD]?.v;
+        if (typeof id === "string") return id;
+        if (legacyIndex === undefined) {
+          const legacy = await c.pullRemoteDoc(INDEX_OBJECT_ID);
+          legacyIndex = legacy?.t === "lww-map" ? legacy.fields : null;
+        }
+        for (const candidate of Object.keys(legacyIndex || {})) {
+          if (!candidate.startsWith(RESERVED_PREFIX) && (await wireId(candidate)) === wireObjectId) return candidate;
+        }
+        return null;
+      },
+    });
+    await writeMissingObjectIds(c);
+    await Promise.all(pendingIndexRefreshes);
+  }
+
+  // 0.9.0 compatibility: add ~id to objects written without it.
+  async function writeMissingObjectIds(c: BucketClient): Promise<void> {
+    const upgraded: string[] = [];
+    for (const id of await c.knownObjectIds()) {
+      if (id.startsWith(RESERVED_PREFIX)) continue;
       const raw = await c.getFields(id);
-      await upsertIndexEntry(id, raw?.[DELETED_FIELD] === true);
+      if (!raw || raw[ID_FIELD] === id) continue;
+      await c.setFields(id, { [ID_FIELD]: id });
+      upgraded.push(id);
     }
-    if (dirtyObjectIds.length > 0) await c.syncObject(INDEX_OBJECT_ID);
+    for (const id of upgraded) await c.flush(id);
   }
 
   function startAutoSync(): void {
     if (!autoSync || !client) return;
-    client.watch([INDEX_OBJECT_ID]);
-    client.start({ indexObjectId: INDEX_OBJECT_ID, ...(syncIntervalMs !== undefined ? { intervalMs: syncIntervalMs } : {}) });
+    client.start({ run: runSyncPass, ...(syncIntervalMs !== undefined ? { intervalMs: syncIntervalMs } : {}) });
   }
 
   // ---- connection (browser) ----------------------------------------------

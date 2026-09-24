@@ -89,8 +89,8 @@ compatibility metadata.
 Deferred service work after this preview release:
 
 - A bucket-scoped hibernatable WebSocket feed under the resource API root.
-  SSE remains compatibility/development-only; SDK fallback is
-  timer/index-diff sync.
+  SSE remains compatibility/development-only; SDK fallback is timer
+  sync over the object index and feed.
 
 ## Public entry
 

@@ -54,6 +54,13 @@ The serialized-value tie-break only keeps malformed duplicate `(ts, actor)`
 input deterministic. Normal writers do not emit two values at the same
 `(ts, actor)`.
 
+Unknown keys are kept, so the body can grow without a format-byte bump:
+
+4. Extra keys in a field entry or tombstone travel with the winning entry;
+   full ties are broken by the canonical JSON of the whole entry.
+5. Unknown top-level keys are unioned; on conflict the larger canonical
+   JSON wins. New top-level keys should carry their own `(ts, actor)`.
+
 `put()` and `update()` preserve timestamps for JSON-unchanged fields.
 Deleting a field writes a tombstone and removes the field entry; rewriting a
 field removes its tombstone.
@@ -74,9 +81,14 @@ read or merged. This prevents a slow device clock from losing all merges.
 The root package facade reserves app object ids and field names starting with
 `~`.
 
-- `~index` is the bucket-maintained encrypted object index used by `list()`
-  and new-device restore.
-- `~deleted` is the bucket-maintained deleted marker for object tombstones.
+- `~id`: the app object id (e.g. `note:<uuid>`), written with the object.
+  It maps a blinded object back to its app id without an index. It must
+  derive to the object's wire id and match the local app id; otherwise the
+  object is a sync error and is neither adopted nor pushed.
+- `~deleted`: the deleted marker for object tombstones.
+- `~index`: a local-only index behind `list()`, never pushed. Entries are
+  `{ updatedAt, rev, deleted? }`; a pulled object's `updatedAt` is its
+  latest field or tombstone timestamp.
 
 Apps cannot write these names through `put()` / `update()` / `delete()`.
 Lower-level source modules must preserve the same reservations when used by
@@ -139,15 +151,18 @@ Raw key bytes are zeroed after derivation.
 
 ## Sync Behavior Relevant To Format
 
-The worker is a relay, not a database/query engine. It does not list objects
-or interpret bucket indexes. The SDK sync loop is:
+The worker is a relay: it never decrypts payloads, but lists current
+heads by wire id (`GET objects:index` snapshot plus `GET feed`).
 
-```text
-pull current -> merge with local -> CAS push
-```
+Each object syncs as `pull current -> merge -> CAS push`, retrying on CAS
+conflict and re-creating it from local state on a remote miss.
 
-On CAS conflict, the SDK pulls the current remote payload, merges, and
-retries. On remote miss with surviving local state, the SDK re-creates the
-object. The internal `~index` object has the same weak relay/eviction
-semantics as every other object; dangling index entries are tolerated and
-read as absent data.
+A sync pass:
+
+1. Read `objects:index`, then `feed` from its `feedCursor` (or from the
+   start) until `hasMoreFeed` is false; later entries win. Result: wire id
+   to current version id. No cursor is persisted.
+2. Sync each local object (not `~index`) that changed remotely, is dirty,
+   or is missing from the result.
+3. For each unknown wire id, decrypt the payload, read `~id`, and sync it;
+   skip it until a later pass if unresolved.

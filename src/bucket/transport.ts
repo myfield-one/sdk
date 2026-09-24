@@ -1,7 +1,8 @@
 // HTTP transport for the open bucket surface: GET current, GET version
-// payload, and object CAS write. Session credentials come from the auth
-// layer; a 401 triggers one forced session refresh and retry before the
-// error escalates (the auth layer decides whether that means disconnected).
+// payload, object CAS write, and current-head listing. Session credentials
+// come from the auth layer; a 401 triggers one forced session refresh and
+// retry before the error escalates (the auth layer decides whether that
+// means disconnected).
 
 import { fnv1a32Bytes, utf8Encode } from "../internal/encoding.ts";
 import { decryptEnvelope, encryptEnvelopeFields } from "./crypto.ts";
@@ -139,9 +140,38 @@ export class BucketTransport {
     return { ok: true, versionId };
   }
 
-  private objectUrl(wireObjectId: string): string {
+  async listHeads(): Promise<Map<string, string>> {
+    const heads = new Map<string, string>();
+    const indexRes = await this.request(() => ({ url: `${this.bucketUrl()}/objects:index`, init: { method: "GET" } }));
+    if (!indexRes.ok) throw new BucketTransportError(`object index failed: ${indexRes.status}`, indexRes.status);
+    const index = await readJsonObject(indexRes, "object index");
+    if (!Array.isArray(index.objects)) throw new BucketTransportError("object index returned invalid response", indexRes.status);
+    addHeads(heads, index.objects);
+    let cursor = typeof index.feedCursor === "string" ? index.feedCursor : null;
+    let hasMore = index.hasMoreFeed === true;
+    for (let page = 0; hasMore; page += 1) {
+      if (page >= MAX_FEED_PAGES) throw new BucketTransportError("feed did not end within page limit", 500);
+      const query = new URLSearchParams({ limit: String(FEED_PAGE_LIMIT) });
+      if (cursor) query.set("cursor", cursor);
+      const feedRes = await this.request(() => ({ url: `${this.bucketUrl()}/feed?${query}`, init: { method: "GET" } }));
+      if (!feedRes.ok) throw new BucketTransportError(`feed failed: ${feedRes.status}`, feedRes.status);
+      const feed = await readJsonObject(feedRes, "feed");
+      if (!Array.isArray(feed.entries)) throw new BucketTransportError("feed returned invalid response", feedRes.status);
+      addHeads(heads, feed.entries);
+      const next = typeof feed.cursor === "string" ? feed.cursor : null;
+      hasMore = feed.hasMore === true && next !== null && next !== cursor;
+      cursor = next;
+    }
+    return heads;
+  }
+
+  private bucketUrl(): string {
     const syncRoot = this.apiBase.endsWith("/v1/api/sync") ? this.apiBase : `${this.apiBase}/v1/api/sync`;
-    return `${syncRoot}/buckets/${encodeURIComponent(this.keys.bucketId)}/objects/${encodeURIComponent(wireObjectId)}`;
+    return `${syncRoot}/buckets/${encodeURIComponent(this.keys.bucketId)}`;
+  }
+
+  private objectUrl(wireObjectId: string): string {
+    return `${this.bucketUrl()}/objects/${encodeURIComponent(wireObjectId)}`;
   }
 
   private async request(build: () => { url: string; init: RequestInit }): Promise<Response> {
@@ -167,6 +197,16 @@ export class BucketTransport {
       headers,
       ...(session.carrier === "cookie" ? { credentials: "include" as RequestCredentials } : {}),
     });
+  }
+}
+
+const FEED_PAGE_LIMIT = 100;
+const MAX_FEED_PAGES = 10_000;
+
+function addHeads(heads: Map<string, string>, entries: unknown[]): void {
+  for (const entry of entries) {
+    const row = entry as { objectId?: unknown; versionId?: unknown } | null;
+    if (typeof row?.objectId === "string" && typeof row.versionId === "string") heads.set(row.objectId, row.versionId);
   }
 }
 

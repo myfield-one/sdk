@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.1
+
+- Sync uses the relay's object index; `~index` is no longer pushed.
+- Fixed a second write in the same millisecond not reaching other devices.
+
 ## 0.9.0
 
 First public release.

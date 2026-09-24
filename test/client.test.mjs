@@ -165,34 +165,59 @@ test("wire ids on the relay are blinded when a mapper is provided", async () => 
   assert.ok(!wireIds[0].includes("index"), "semantic id does not reach the relay");
 });
 
-test("auto sync uses index diff instead of sweeping every known object", async () => {
+test("sync pass pulls only objects whose relay head changed", async () => {
   const relay = createMockRelay();
   const seed = makeClient(relay, "actor-seed");
-  await seed.setFields("~index", { "note:1": { updatedAt: "1" }, "note:2": { updatedAt: "1" } });
   await seed.setFields("note:1", { markdown: "one" });
   await seed.setFields("note:2", { markdown: "two" });
   await seed.syncKnown();
 
-  const a = makeClient(relay, "actor-a");
-  await a.syncObject("~index");
+  const base = relay.transport();
+  const pulled = [];
+  const a = makeClient(relay, "actor-a", {
+    transport: {
+      ...base,
+      async pullPayload(id, version) {
+        pulled.push(id);
+        return base.pullPayload(id, version);
+      },
+    },
+  });
   await a.syncObject("note:1");
   await a.syncObject("note:2");
-  assert.deepEqual(await a.getFields("note:1"), { markdown: "one" });
-  assert.deepEqual(await a.getFields("note:2"), { markdown: "two" });
+  pulled.length = 0;
 
   const remote = makeClient(relay, "actor-remote");
-  await remote.syncObject("~index");
   await remote.syncObject("note:1");
-  await remote.syncObject("note:2");
   await remote.setFields("note:1", { markdown: "one updated" });
-  await remote.setFields("note:2", { markdown: "two updated but not indexed" });
-  await remote.setFields("~index", { "note:1": { updatedAt: "2" }, "note:2": { updatedAt: "1" } });
-  await remote.syncKnown();
+  await remote.syncObject("note:1");
 
-  await a.syncAuto({ indexObjectId: "~index" });
-
+  await a.syncPass();
+  assert.deepEqual(pulled, ["note:1"]);
   assert.deepEqual(await a.getFields("note:1"), { markdown: "one updated" });
   assert.deepEqual(await a.getFields("note:2"), { markdown: "two" });
+});
+
+test("an unresolvable object is not downloaded again until its head changes", async () => {
+  const relay = createMockRelay();
+  const seed = makeClient(relay, "actor-seed");
+  await seed.setFields("note:1", { markdown: "orphan" });
+  await seed.syncObject("note:1");
+
+  const a = makeClient(relay, "actor-a");
+  let resolves = 0;
+  const resolveUnknown = async () => {
+    resolves += 1;
+    return null;
+  };
+  await a.syncPass({ resolveUnknown });
+  await a.syncPass({ resolveUnknown });
+  assert.equal(resolves, 1);
+
+  await seed.setFields("note:1", { markdown: "changed" });
+  await seed.syncObject("note:1");
+  await a.syncPass({ resolveUnknown: async (wireId) => wireId });
+  assert.deepEqual(await a.getFields("note:1"), { markdown: "changed" }, "a new head is resolved again");
 });
 
 test("unchanged head sync does not pull payload", async () => {

@@ -1,6 +1,6 @@
 {
   "name": "@myfield/sdk",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Myfield open SDK: instance auth and end-to-end-encrypted bucket sync for third-party web apps.",
   "license": "Apache-2.0",
   "author": "OPENTECH AI PTE. LTD.",

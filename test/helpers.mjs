@@ -10,6 +10,10 @@ export function createMockRelay() {
     },
     transport() {
       return {
+        // Current-head listing (objects:index snapshot + feed tail).
+        async listHeads() {
+          return new Map(Array.from(objects, ([wireId, entry]) => [wireId, entry.versionId]));
+        },
         async pullHead(wireId) {
           const entry = objects.get(wireId);
           if (!entry) return { found: false };
