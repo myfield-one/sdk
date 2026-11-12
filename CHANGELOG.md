@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.2-alpha.1 (unreleased)
+
+- Add Instance `resume()`, `connect()`, `disconnect()` and state events, plus
+  `instance.remote.getBucket()` for remote reads and CAS commits without Local sync.
+- Add `ClientError` and request cancellation. CAS rejection returns a result;
+  uncertain acknowledgements throw. Remote requests never retry automatically.
+- Add `createInstance(namespace)` with lowercase domain-form names up to 63 characters.
+  Existing initialization, storage and formats remain compatible. Local and Remote
+  access to the same bucket require separate Instances.
+
 ## 0.9.1
 
 - Sync uses the relay's object index; `~index` is no longer pushed.

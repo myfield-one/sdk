@@ -56,9 +56,16 @@ export type Bucket = {
 
 export type Instance = {
   readonly namespace: string;
+  readonly remote: { getBucket(): RemoteBucket };
+  readonly state: BucketState;
+  resume(): Promise<BucketState>;
+  connect(): Promise<BucketState>;
+  disconnect(): Promise<void>;
+  on(event: "state", handler: (state: BucketState, error?: ClientError) => void): () => void;
   createBucket(options: { id: string }): Bucket;
 };
 
+export declare function createInstance(namespace: string): Instance;
 export declare function createInstance(options?: CreateInstanceOptions): Instance;
 
 export declare class NotConnectedError extends Error {
@@ -67,4 +74,51 @@ export declare class NotConnectedError extends Error {
 
 export declare class OfflineError extends Error {
   constructor();
+}
+
+export type RequestOptions = { signal?: AbortSignal };
+
+export type VersionMeta = {
+  objectId: string;
+  versionId: string;
+  parentVersionIds: string[];
+  payloadHash?: string;
+  [field: string]: unknown;
+};
+
+export type CurrentVersion = {
+  versionId: string;
+  headVersionMeta: VersionMeta;
+  [field: string]: unknown;
+};
+
+export type ObjectVersion<TPayload = Response> = { meta: VersionMeta; payload: TPayload };
+export type CommitInput = { meta: VersionMeta; payload: Blob | Uint8Array; expectedHeadVersionId: string | null };
+export type CommitResult = { ok: true } | { ok: false; reason: "version-mismatch" | "conflict" };
+
+export interface RemoteBucket {
+  getCurrent(objectId: string, options?: RequestOptions): Promise<CurrentVersion | null>;
+  getVersion(objectId: string, versionId: string, options?: RequestOptions): Promise<ObjectVersion>;
+  getVersionMeta(objectId: string, versionId: string, options?: RequestOptions): Promise<VersionMeta>;
+  getPayload(objectId: string, versionId: string, options?: RequestOptions): Promise<Response>;
+  commit(input: CommitInput, options?: RequestOptions): Promise<CommitResult>;
+}
+
+export type ClientErrorOptions = {
+  status?: number;
+  requestId?: string;
+  retryable?: boolean;
+  retryAfterMs?: number;
+  maxBytes?: number;
+  cause?: unknown;
+};
+
+export declare class ClientError extends Error {
+  readonly code: string;
+  readonly status?: number;
+  readonly requestId?: string;
+  readonly retryable: boolean;
+  readonly retryAfterMs?: number;
+  readonly maxBytes?: number;
+  constructor(code: string, message: string, options?: ClientErrorOptions);
 }

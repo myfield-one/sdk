@@ -7,3 +7,32 @@ export class NotConnectedError extends Error {
     this.name = "NotConnectedError";
   }
 }
+
+export type ClientErrorOptions = {
+  status?: number;
+  requestId?: string;
+  retryable?: boolean;
+  retryAfterMs?: number;
+  maxBytes?: number;
+  cause?: unknown;
+};
+
+export class ClientError extends Error {
+  readonly code: string;
+  readonly status?: number;
+  readonly requestId?: string;
+  readonly retryable: boolean;
+  readonly retryAfterMs?: number;
+  readonly maxBytes?: number;
+
+  constructor(code: string, message: string, options: ClientErrorOptions = {}) {
+    super(message, { cause: options.cause });
+    this.name = "ClientError";
+    this.code = code;
+    this.status = options.status;
+    this.requestId = options.requestId;
+    this.retryable = options.retryable ?? false;
+    this.retryAfterMs = options.retryAfterMs;
+    this.maxBytes = options.maxBytes;
+  }
+}
