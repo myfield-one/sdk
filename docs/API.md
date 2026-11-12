@@ -19,20 +19,20 @@ const notes = await bucket.list({ prefix: "note:" });
 await bucket.connect();
 ```
 
-## `createInstance(options?)`
+## `createInstance`
 
 ```ts
-function createInstance(options?: {
-  namespace?: string;                // default "default"
-  storage?: "indexeddb" | "memory";  // default "indexeddb"
+createInstance(namespace: string): Instance;
+createInstance(options?: {
+  namespace?: string;
+  storage?: "indexeddb" | "memory";
 }): Instance;
 ```
 
-- `namespace` is a local storage scope. It defaults to `"default"` and must
-  match `a-z0-9`, max 32 chars.
-- `storage: "indexeddb"` persists local data, instance keys, auth context, and
-  sync metadata.
-- `storage: "memory"` keeps all state process-local and ephemeral.
+Defaults: namespace `"default"`, IndexedDB at `myfield-sdk:${namespace}` / `kv`.
+Use lowercase ASCII domain labels, at most 63 characters total. Keep existing names
+for data and 0.9.1 compatibility. The object form trims whitespace and also supports
+memory storage.
 
 ## `instance.createBucket(options)`
 
@@ -209,3 +209,40 @@ The returned function unsubscribes the listener.
 - External KV mutation detection.
 - Public feed, batch, snapshot, or version-history APIs.
 - `setFields()` / `getFields()` as the quickstart path.
+
+## Remote Object API
+
+```ts
+import { createInstance } from "@myfield/sdk";
+
+const instance = createInstance("notes.example.com");
+const remote = instance.remote.getBucket();
+await instance.resume(); // Startup; never prompts.
+
+if (instance.state === "connected") {
+  const head = await remote.getCurrent("note:1");
+  if (head) {
+    const { meta, payload } = await remote.getVersion("note:1", head.versionId);
+    console.log(meta.versionId, await payload.arrayBuffer());
+  }
+}
+// Call instance.connect() from your Connect button.
+```
+
+`getBucket()` returns the namespace's Remote handle. Resume or connect before using
+it. Missing current objects return null; missing versions throw. `getVersion()`
+returns metadata and a payload Response; consume or cancel its body.
+
+`resume()` restores access without prompting. Call `connect()` from a user action
+to authorize or recover from `NOT_AUTHORIZED`; network failures never open authorization.
+Both return the connection state; `on("state")` reports changes and errors.
+`disconnect()` clears shared bucket access and pending requests across tabs,
+retaining keys, objects and endpoints.
+Remote operations do not start Local sync.
+
+`commit()` submits app-encoded metadata and encrypted bytes against
+`expectedHeadVersionId`; null requests creation. The app owns encryption and merge.
+
+CAS rejection returns `{ok:false, reason}`; other failures throw `ClientError`.
+After an uncertain failure, preserve version IDs, bytes and local edits. Methods
+accept `{signal}` and do not automatically retry.

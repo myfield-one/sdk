@@ -232,7 +232,7 @@ test("createBucket returns the same handle for the same id", async () => {
 test("invalid namespaces are rejected", () => {
   assert.throws(() => createInstance({ namespace: "Bad-Name" }));
   assert.throws(() => createInstance({ namespace: "" }));
-  assert.throws(() => createInstance({ namespace: "a".repeat(33) }));
+  assert.throws(() => createInstance({ namespace: "a".repeat(64) }));
 });
 
 // ---- reserved namespace -----------------------------------------------------
@@ -459,9 +459,9 @@ test("createInstance defaults namespace to default", async () => {
   assert.deepEqual(await again.get("note:default"), { body: "default namespace" });
 });
 
-test("namespace validation is intentionally narrow", () => {
+test("namespace validation accepts domain-form names", () => {
   assert.throws(() => createInstance({ namespace: "", storage: "memory" }));
-  assert.throws(() => createInstance({ namespace: "notes-dev", storage: "memory" }));
+  assert.equal(createInstance({ namespace: "notes-dev", storage: "memory" }).namespace, "notes-dev");
   assert.throws(() => createInstance({ namespace: "Notes", storage: "memory" }));
 });
 

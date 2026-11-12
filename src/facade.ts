@@ -25,8 +25,11 @@ import {
 } from "./bucket/store.ts";
 import { BucketTransport, OfflineError } from "./bucket/transport.ts";
 import { createInstanceAuthClient, isValidBucketId, type AuthCallbackResult, type InstanceAuthClient } from "./auth/instance.ts";
-import { NotConnectedError } from "./errors.ts";
+import { ClientError, NotConnectedError } from "./errors.ts";
 import { randomId } from "./internal/encoding.ts";
+
+import { createInstanceConnection } from "./remote/connection.ts";
+import type { RemoteBucket } from "./remote/bucket.ts";
 
 const DEFAULT_AUTH_BASE = "https://myfield.one/auth/";
 const DEFAULT_API_BASE = "https://api.myfield.one";
@@ -76,11 +79,25 @@ export type Bucket = {
 
 export type Instance = {
   readonly namespace: string;
+  readonly remote: { getBucket(): RemoteBucket };
+  readonly state: BucketState;
+  resume(): Promise<BucketState>;
+  connect(): Promise<BucketState>;
+  disconnect(): Promise<void>;
+  on(event: "state", handler: (state: BucketState, error?: ClientError) => void): () => void;
   createBucket(options: { id: string }): Bucket;
 };
 
-export function createInstance(options: CreateInstanceOptions = {}): Instance {
-  const namespace = normalizeNamespace(options.namespace);
+export const instanceTestCleanup = new WeakMap<Instance, () => void>();
+
+export function createInstance(namespace: string): Instance;
+export function createInstance(options?: CreateInstanceOptions): Instance;
+export function createInstance(input: string | CreateInstanceOptions = {}, ...extra: unknown[]): Instance {
+  if (typeof input === "string" && extra.length) throw new ClientError("INVALID_INPUT", "createInstance accepts a namespace or an options object, without additional arguments");
+  const options: CreateInstanceOptions = typeof input === "string" ? { namespace: input } : input;
+  if (!options || typeof options !== "object" || Array.isArray(options)) throw new ClientError("INVALID_INPUT", "Instance options are required");
+  if ("authUrl" in options) throw new ClientError("INVALID_INPUT", "Custom authorization URLs are not supported by the Instance API");
+  const namespace = normalizeNamespace(typeof input === "string" || options.namespace === undefined ? options.namespace : String(options.namespace).trim());
   const storageKind = options.storage || "indexeddb";
 
   const baseAdapter =
@@ -92,10 +109,19 @@ export function createInstance(options: CreateInstanceOptions = {}): Instance {
   // One handle per bucket id: separate facades over the same storage would
   // split event listeners and duplicate clients/clocks/debounce timers.
   const buckets = new Map<string, Bucket>();
+  const connection = createInstanceConnection({ namespace, data: baseAdapter, auth: authAdapter, hasLegacyBucket: () => buckets.has(namespace), persistent: storageKind !== "memory" });
+  let disposed = false;
 
-  return {
+  const instance: Instance = {
     namespace,
+    remote: connection.remote,
+    get state() { return connection.state; },
+    resume: connection.resume,
+    on: connection.on,
+    connect: connection.connect,
+    disconnect: connection.disconnect,
     createBucket(bucketOptions) {
+      if (disposed) throw new ClientError("DISPOSED", "Instance has been disposed");
       const bucketId = String(bucketOptions?.id || "").trim();
       if (!bucketId) throw new Error("bucket id is required");
       if (!isValidBucketId(bucketId)) throw new Error("invalid bucketId");
@@ -103,9 +129,16 @@ export function createInstance(options: CreateInstanceOptions = {}): Instance {
       if (existing) return existing;
       const bucket = createBucketFacade({ namespace, bucketId, dataAdapter: baseAdapter, authAdapter });
       buckets.set(bucketId, bucket);
+      if (bucketId === namespace) connection.block();
       return bucket;
     },
   };
+  instanceTestCleanup.set(instance, () => {
+    disposed = true;
+    for (const bucket of buckets.values()) bucket.dispose();
+    connection.dispose();
+  });
+  return instance;
 }
 
 // ---------------------------------------------------------------------------
@@ -721,10 +754,9 @@ function createBucketFacade(deps: BucketDeps): Bucket {
 }
 
 function normalizeNamespace(value: string | undefined): string {
-  const namespace = value === undefined ? "default" : String(value).trim();
-  if (!namespace) throw new Error("namespace is required");
-  if (!/^[a-z0-9]{1,32}$/.test(namespace)) {
-    throw new Error("namespace must use lowercase letters and digits only (a-z0-9, max 32)");
+  const namespace = value === undefined ? "default" : value;
+  if (typeof namespace !== "string" || namespace.length > 63 || !namespace.split(".").every(label => /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label))) {
+    throw new ClientError("INVALID_INPUT", "namespace must be a lowercase domain-form name of 1–63 characters");
   }
   return namespace;
 }

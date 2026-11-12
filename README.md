@@ -38,6 +38,15 @@ const entries = await bucket.list({ prefix: "note:" });
 await bucket.connect(); // defaults to https://myfield.one/auth/
 ```
 
+## Remote object access
+
+Use `createInstance("notes.example.com")`, then `instance.resume()` on startup
+and `instance.connect()` from a user action. `instance.remote.getBucket()` provides
+direct Remote object reads and CAS commits.
+The SDK reuses instance authorization; the app owns payload encryption and local
+storage. Remote connection does not start Local synchronization.
+See [Remote Object API](docs/API.md#remote-object-api).
+
 ## What the SDK handles
 
 - **Auth**: instance keygen, the `https://myfield.one/auth/` authorization
@@ -80,7 +89,7 @@ await bucket.connect(); // defaults to https://myfield.one/auth/
 
 ## Current service status
 
-The public SDK facade no longer exposes `apiBase`. The auth service returns
+The Local facade does not expose `apiBase`. The auth service returns
 `resourceApiUrl` in the encrypted callback result, so SDKs do not encode
 deployment host rules. The SDK uses `bucketAccessGrant.resourceId` as the
 remote sync resource id, with `envelope.bucketId` treated as optional
@@ -96,7 +105,7 @@ Deferred service work after this preview release:
 
 | Entry | Contents |
 | --- | --- |
-| `@myfield/sdk` | `createInstance` facade, bucket types, connection state, and SDK error classes |
+| `@myfield/sdk` | `createInstance`, `instance.remote.getBucket`, public types and error classes |
 
 Local persistence defaults to IndexedDB. A memory backend is available for
 tests and ephemeral clients; custom storage factories are lower-level
@@ -119,6 +128,7 @@ pnpm install --ignore-workspace
 npm run build
 npm test          # node --test (contract layer, mocked relay/auth)
 npm run typecheck # tsc --noEmit
+npm run typecheck:api # public declarations
 ```
 
 Repository-level maintainer browser E2E lives under `tests/sdk-e2e/` and is
