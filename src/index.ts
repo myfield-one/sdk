@@ -26,3 +26,4 @@ export type { RemoteBucket, VersionMeta, CurrentVersion, ObjectVersion, CommitIn
 export type { RequestOptions } from "./remote/http.ts";
 export { ClientError } from "./errors.ts";
 export type { ClientErrorOptions } from "./errors.ts";
+export type { InstanceKey } from "./auth/keys.ts";

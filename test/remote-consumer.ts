@@ -69,3 +69,15 @@ void feed; void history;
 const bucket = createInstance({ namespace: "existing", storage: "memory" }).createBucket({ id: "app.example.com" });
 await bucket.ready(); await bucket.put("note", { text: "existing" });
 bucket.on("state", state => console.log(state));
+
+const imported = createInstance({ appId: "card.example.com", namespace: "default" });
+const existingKey = null! as import("../types/index.js").InstanceKey;
+const savedKey: import("../types/index.js").InstanceKey | null = await imported.getKey();
+const createdKey: import("../types/index.js").InstanceKey = await imported.createKey();
+void savedKey; void createdKey;
+await imported.removeKey();
+await imported.importKey(existingKey);
+// @ts-expect-error Import has no force parameter.
+await imported.importKey(existingKey, { force: true });
+// @ts-expect-error Custom database configuration is not public.
+createInstance({ appId: "card.example.com", authStorage: { dbName: "custom" } });

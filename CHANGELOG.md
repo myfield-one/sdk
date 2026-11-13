@@ -2,6 +2,10 @@
 
 ## 0.9.2-alpha.1 (unreleased)
 
+- Add appId initialization and Instance key read/create/import/removal with nonextractable keys.
+  String initialization now means appId, which scopes identity and default storage;
+  namespace overrides storage scope.
+  Invalid identities remain intact for explicit recovery; Local objects are retained.
 - Separate instance key, proof and session internals; preserve APIs and stored records.
   Derive instance IDs from public key material only.
 - Add Remote index/feed queries, paged version history, ancestry evidence and
@@ -10,7 +14,7 @@
   `instance.remote.getBucket()` for remote reads and CAS commits without Local sync.
 - Add `ClientError` and request cancellation. CAS rejection returns a result;
   uncertain acknowledgements throw. Remote requests never retry automatically.
-- Add `createInstance(namespace)` with lowercase domain-form names up to 63 characters.
+- Accept lowercase domain-form appIds up to 63 characters.
   Existing initialization, storage and formats remain compatible. Local and Remote
   access to the same bucket require separate Instances.
 

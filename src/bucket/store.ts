@@ -6,7 +6,9 @@ export type StorageAdapter = {
   get<T = unknown>(key: string): Promise<T | null>;
   set(key: string, value: unknown): Promise<void>;
   remove(key: string): Promise<void>;
+  removePrefix?(prefix: string): Promise<void>;
   keys(prefix: string): Promise<string[]>;
+  insertIfEmpty?(prefix: string, entries: { key: string; value: unknown }[]): Promise<boolean>;
 };
 
 // Per-process registry so memory-backed instances behave like persistent
@@ -29,6 +31,15 @@ export function createMemoryStorageAdapter(): StorageAdapter {
 
 function memoryAdapterOver(map: Map<string, unknown>): StorageAdapter {
   return {
+    async removePrefix(prefix) {
+      for (const key of map.keys()) if (key.startsWith(prefix)) map.delete(key);
+    },
+    async insertIfEmpty(prefix, entries) {
+      if ([...map.keys()].some(key => key.startsWith(prefix))) return false;
+      const cloned = entries.map(({ key, value }) => ({ key, value: structuredClone(value) }));
+      for (const { key, value } of cloned) map.set(key, value);
+      return true;
+    },
     async get<T>(key: string): Promise<T | null> {
       return map.has(key) ? (structuredClone(map.get(key)) as T) : null;
     },
@@ -51,6 +62,26 @@ export function createIndexedDbStorageAdapter(options: { dbName: string; storeNa
   const dbName = options.dbName;
   const storeName = options.storeName || "kv";
   return {
+    removePrefix: prefix => withIdb(dbName, storeName, db => new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(storeName, "readwrite");
+      tx.objectStore(storeName).delete(IDBKeyRange.bound(prefix, `${prefix}\uffff`));
+      tx.oncomplete = () => resolve();
+      tx.onabort = tx.onerror = () => reject(tx.error || new Error("Atomic removal failed"));
+    })),
+    insertIfEmpty: (prefix, entries) => withIdb(dbName, storeName, db => new Promise((resolve, reject) => {
+      const tx = db.transaction(storeName, "readwrite"), store = tx.objectStore(storeName);
+      let inserted = false;
+      const count = store.count(IDBKeyRange.bound(prefix, `${prefix}\uffff`));
+      count.onsuccess = () => {
+        if (count.result) return;
+        try {
+          for (const { key, value } of entries) store.put(value, key);
+          inserted = true;
+        } catch (error) { tx.abort(); reject(error); }
+      };
+      tx.oncomplete = () => resolve(inserted);
+      tx.onabort = tx.onerror = () => reject(tx.error || new Error("Atomic write failed"));
+    })),
     get: <T>(key: string) =>
       withIdb<T | null>(dbName, storeName, (db) =>
         requestPromise<T | null>((resolve, reject) => {

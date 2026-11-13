@@ -40,7 +40,7 @@ await bucket.connect(); // defaults to https://myfield.one/auth/
 
 ## Remote object access
 
-Use `createInstance("notes.example.com")`, then `instance.resume()` on startup
+Use `createInstance({ appId: "notes.example.com" })`, then `instance.resume()` on startup
 and `instance.connect()` from a user action. `instance.remote.getBucket()` provides
 object reads, CAS commits, version history and change notifications.
 The SDK reuses instance authorization; the app owns payload encryption and local
