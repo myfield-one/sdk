@@ -42,7 +42,7 @@ await bucket.connect(); // defaults to https://myfield.one/auth/
 
 Use `createInstance("notes.example.com")`, then `instance.resume()` on startup
 and `instance.connect()` from a user action. `instance.remote.getBucket()` provides
-direct Remote object reads and CAS commits.
+object reads, CAS commits, version history and change notifications.
 The SDK reuses instance authorization; the app owns payload encryption and local
 storage. Remote connection does not start Local synchronization.
 See [Remote Object API](docs/API.md#remote-object-api).
@@ -66,7 +66,6 @@ See [Remote Object API](docs/API.md#remote-object-api).
 - **Sync triggers**: launch/resume, post-write debounce, and a timer
   fallback. Browser lifecycle triggers such as focus/visibility are app
   choices: call `bucket.sync()` from those handlers when that fits your UI.
-  No server push in v1.
 
 ## Honest boundaries
 
@@ -120,16 +119,15 @@ ports (payload layout, merge rules, id derivation): see
 
 ## Development
 
-This package is dependency-free at runtime and managed independently of the
-monorepo workspace (standalone lockfile) so it can be extracted cleanly.
+This package has no runtime dependencies and uses a standalone pnpm lockfile.
 
 ```sh
-pnpm install --ignore-workspace
+pnpm install
 npm run build
 npm test          # node --test (contract layer, mocked relay/auth)
 npm run typecheck # tsc --noEmit
 npm run typecheck:api # public declarations
+MYFIELD_TEST_AUTH_URL="https://your-test-host/auth/" npm run verify:remote
 ```
 
-Repository-level maintainer browser E2E lives under `tests/sdk-e2e/` and is
-run from the workspace root with `pnpm run test:sdk:e2e`.
+`verify:remote` is the SDK's standalone Remote API smoke check against a test service.

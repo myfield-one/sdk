@@ -207,7 +207,7 @@ The returned function unsubscribes the listener.
 - Public subpaths such as `@myfield/sdk/auth` or `@myfield/sdk/bucket`.
 - Capability negotiation APIs.
 - External KV mutation detection.
-- Public feed, batch, snapshot, or version-history APIs.
+- Remote batch or snapshot APIs.
 - `setFields()` / `getFields()` as the quickstart path.
 
 ## Remote Object API
@@ -244,5 +244,34 @@ Remote operations do not start Local sync.
 `expectedHeadVersionId`; null requests creation. The app owns encryption and merge.
 
 CAS rejection returns `{ok:false, reason}`; other failures throw `ClientError`.
-After an uncertain failure, preserve version IDs, bytes and local edits. Methods
-accept `{signal}` and do not automatically retry.
+After an uncertain failure, preserve version IDs, bytes and local edits.
+All Remote requests support cancellation with `{ signal }` and do not automatically retry.
+
+### Discovery and change hints
+
+| Method | Result |
+| --- | --- |
+| `getIndex()` | Current heads, nullable `feedCursor`, `hasMoreFeed`. |
+| `listFeed({cursor, limit})` | One page of entries, `cursor`, `hasMore`. |
+| `getCurrent(id, {knownVersionId})` | Current head with ancestry evidence in `history`. |
+| `listVersions(id, versionId, {cursor, limit})` | Metadata plus `history` and `nextCursor`. |
+| `watchFeed()` | Resolves after subscription; returns a stream of `{objectId, versionId}` hints. |
+
+Cursors are opaque; null or omitted starts at the beginning. Read feed pages from
+`index.feedCursor` while `hasMore`. For `listVersions`, keep the same object/version
+anchor and continue until `nextCursor` is null.
+
+With `knownVersionId`, `getCurrent` returns newest-first ancestry evidence: a nonempty
+`history` proves ancestry, `[]` means no stored proof, and `null` means incomplete
+evidence. `listVersions` lists committed versions, not a complete parent graph.
+
+Await `watchFeed` before catching up the feed. Each hint prompts another catch-up.
+Abort or close the stream to stop; it does not reconnect automatically.
+
+```js
+const stream = await remote.watchFeed({ signal });
+// Catch up the feed before consuming hints.
+for await (const hint of stream) {
+  console.log(hint.objectId, hint.versionId);
+}
+```

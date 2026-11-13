@@ -4,7 +4,7 @@ import type { StorageAdapter } from "../bucket/store.ts";
 import { ClientError } from "../errors.ts";
 import { createHttpRequest } from "./http.ts";
 import { createRemoteClient, type RemoteClient } from "./client.ts";
-import type { RemoteBucket } from "./bucket.ts";
+import type { RemoteBucket, FeedHint } from "./bucket.ts";
 
 const DEFAULT_AUTH_URL = "https://myfield.one/auth/";
 type ConnectionState = "disconnected" | "connecting" | "connected";
@@ -387,8 +387,12 @@ export function createInstanceConnection(deps: {
   async function invoke<T>(operation: (bucket: RemoteBucket) => Promise<T>): Promise<T> {
     assertUsable();
     if (!remoteClient || !connectionController) throw notAuthorized("Call instance.connect() before Remote operations");
-    const controller = connectionController;
-    try { return await operation(remoteClient.getBucket()); }
+    const client = remoteClient;
+    return handleOperation(connectionController, () => operation(client.getBucket()));
+  }
+
+  async function handleOperation<T>(controller: AbortController, operation: () => Promise<T>): Promise<T> {
+    try { return await operation(); }
     catch (error) {
       if (error instanceof ClientError && isAuthorizationError(error)) {
         const failure = notAuthorized(error.message, error);
@@ -405,6 +409,45 @@ export function createInstanceConnection(deps: {
     getVersionMeta: (...args) => invoke(bucket => bucket.getVersionMeta(...args)),
     getPayload: (...args) => invoke(bucket => bucket.getPayload(...args)),
     commit: (...args) => invoke(bucket => bucket.commit(...args)),
+    getIndex: (...args) => invoke(bucket => bucket.getIndex(...args)),
+    listFeed: (...args) => invoke(bucket => bucket.listFeed(...args)),
+    listVersions: (...args) => invoke(bucket => bucket.listVersions(...args)),
+    async watchFeed(options) {
+      assertUsable();
+      if (!remoteClient || !connectionController) throw notAuthorized("Call instance.connect() before Remote operations");
+      const controller = connectionController;
+      const client = remoteClient;
+      const stream = await handleOperation(controller, () => client.getBucket().watchFeed(options)).catch(error => {
+        controller.signal.throwIfAborted();
+        throw error;
+      });
+      if (controller.signal.aborted) {
+        await stream.return(undefined);
+        controller.signal.throwIfAborted();
+      }
+      const watched: AsyncGenerator<FeedHint> = {
+        async next() {
+          try {
+            controller.signal.throwIfAborted();
+            const next = await handleOperation(controller, () => stream.next());
+            controller.signal.throwIfAborted();
+            return next;
+          } catch (error) {
+            await stream.return(undefined);
+            controller.signal.throwIfAborted();
+            throw error;
+          }
+        },
+        return: value => stream.return(value),
+        throw: error => stream.throw(error),
+        [Symbol.asyncIterator]() { return watched; },
+      };
+      const asyncDispose = Reflect.get(Symbol, "asyncDispose");
+      if (typeof asyncDispose === "symbol") {
+        Object.defineProperty(watched, asyncDispose, { value: async () => { await stream.return(undefined); } });
+      }
+      return watched;
+    },
   };
 
   function start(prompt: boolean, args: unknown[]): Promise<ConnectionState> {

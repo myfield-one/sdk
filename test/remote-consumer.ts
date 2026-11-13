@@ -1,6 +1,7 @@
 import {
   createInstance, ClientError,
   type CreateInstanceOptions, type RemoteBucket, type CurrentVersion, type VersionMeta,
+  type PageOptions, type VersionHistory, type FeedHint, type FeedPage, type BucketIndex,
   type ObjectVersion, type CommitInput, type CommitResult, type RequestOptions, type ClientErrorOptions,
 } from "../types/index.js";
 import type * as Source from "../src/index.ts";
@@ -13,6 +14,11 @@ type DeclarationParity = [
   Assert<Same<ReturnType<typeof createInstance>["connect"], Source.Instance["connect"]>>,
   Assert<Same<ReturnType<typeof createInstance>["on"], Source.Instance["on"]>>,
   Assert<Same<RemoteBucket, Source.RemoteBucket>>,
+  Assert<Same<PageOptions, Source.PageOptions>>,
+  Assert<Same<VersionHistory, Source.VersionHistory>>,
+  Assert<Same<FeedHint, Source.FeedHint>>,
+  Assert<Same<FeedPage, Source.FeedPage>>,
+  Assert<Same<BucketIndex, Source.BucketIndex>>,
   Assert<Same<VersionMeta, Source.VersionMeta>>,
   Assert<Same<CurrentVersion, Source.CurrentVersion>>,
   Assert<Same<ObjectVersion, Source.ObjectVersion>>,
@@ -53,10 +59,13 @@ const result: CommitResult = await remote.commit({ ...version, expectedHeadVersi
 if (!result.ok) { const reason: "version-mismatch" | "conflict" = result.reason; void reason; }
 // @ts-expect-error CAS must be explicit.
 void remote.commit(version);
-// @ts-expect-error History is a later batch.
-void remote.getCurrent("note", { have: "old" });
-// @ts-expect-error Feed is a later batch.
-void remote.watchFeed();
+await remote.getCurrent("note", { knownVersionId: "old", signal });
+const index: BucketIndex = await remote.getIndex({ signal });
+const feed: FeedPage = await remote.listFeed({ cursor: index.feedCursor, limit: 100, signal });
+const history: VersionHistory = await remote.listVersions("note", "v1", { cursor: null, signal });
+const stream = await remote.watchFeed({ signal });
+for await (const hint of stream) { console.log(hint.objectId, hint.versionId); }
+void feed; void history;
 const bucket = createInstance({ namespace: "existing", storage: "memory" }).createBucket({ id: "app.example.com" });
 await bucket.ready(); await bucket.put("note", { text: "existing" });
 bucket.on("state", state => console.log(state));

@@ -2,6 +2,8 @@
 
 ## 0.9.2-alpha.1 (unreleased)
 
+- Add Remote index/feed queries, paged version history, ancestry evidence and
+  change notifications.
 - Add Instance `resume()`, `connect()`, `disconnect()` and state events, plus
   `instance.remote.getBucket()` for remote reads and CAS commits without Local sync.
 - Add `ClientError` and request cancellation. CAS rejection returns a result;

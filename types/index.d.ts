@@ -89,6 +89,7 @@ export type VersionMeta = {
 export type CurrentVersion = {
   versionId: string;
   headVersionMeta: VersionMeta;
+  history?: string[] | null;
   [field: string]: unknown;
 };
 
@@ -96,12 +97,22 @@ export type ObjectVersion<TPayload = Response> = { meta: VersionMeta; payload: T
 export type CommitInput = { meta: VersionMeta; payload: Blob | Uint8Array; expectedHeadVersionId: string | null };
 export type CommitResult = { ok: true } | { ok: false; reason: "version-mismatch" | "conflict" };
 
+export type PageOptions = RequestOptions & { cursor?: string | null; limit?: number };
+export type VersionHistory = VersionMeta & { history: string[]; nextCursor: string | null };
+export type FeedHint = { objectId: string; versionId: string };
+export type FeedPage = { entries: FeedHint[]; cursor: string; hasMore: boolean; [field: string]: unknown };
+export type BucketIndex = { bucketId: string; objects: FeedHint[]; feedCursor: string | null; hasMoreFeed: boolean; [field: string]: unknown };
+
 export interface RemoteBucket {
-  getCurrent(objectId: string, options?: RequestOptions): Promise<CurrentVersion | null>;
+  getCurrent(objectId: string, options?: RequestOptions & { knownVersionId?: string | null }): Promise<CurrentVersion | null>;
   getVersion(objectId: string, versionId: string, options?: RequestOptions): Promise<ObjectVersion>;
   getVersionMeta(objectId: string, versionId: string, options?: RequestOptions): Promise<VersionMeta>;
   getPayload(objectId: string, versionId: string, options?: RequestOptions): Promise<Response>;
   commit(input: CommitInput, options?: RequestOptions): Promise<CommitResult>;
+  listVersions(objectId: string, versionId: string, options?: PageOptions): Promise<VersionHistory>;
+  getIndex(options?: RequestOptions): Promise<BucketIndex>;
+  listFeed(options?: PageOptions): Promise<FeedPage>;
+  watchFeed(options?: RequestOptions): Promise<AsyncGenerator<FeedHint>>;
 }
 
 export type ClientErrorOptions = {

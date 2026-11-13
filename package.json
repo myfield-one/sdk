@@ -47,6 +47,7 @@
     "build": "esbuild src/index.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=dist/index.js",
     "prepack": "npm run build",
     "test": "node --experimental-strip-types --test test/*.test.mjs",
+    "verify:remote": "node scripts/verify-remote.mjs",
     "typecheck": "tsc --noEmit",
     "typecheck:api": "tsc --noEmit --strict --allowImportingTsExtensions --module NodeNext --moduleResolution NodeNext --target ES2022 test/remote-consumer.ts"
   },
