@@ -203,3 +203,25 @@ for (const failedRoute of ["instance-challenge", "instance-session"]) {
     assert.equal(calls.length, (failedRoute === "instance-challenge" ? 1 : 2) + 4, "saved bearer is reused after reopening");
   });
 }
+
+
+test("restoring an existing identity preserves its saved ID even with annotated public JWK", async () => {
+  const { deriveInstanceId } = await import("../src/auth/keys.ts");
+  const { sha256Hex, stableStringify } = await import("../src/internal/encoding.ts");
+  const storage = createReferenceStorage();
+  const original = await makeAuthClient({ storage }).client.ensureInstance();
+  const prefix = `instance:${encodeURIComponent(BUCKET_ID)}:`;
+  const signingPublicJwk = { ...original.signingPublicJwk, kid: "existing-key", alg: "ES256", use: "sig" };
+  const legacyId = "inst_" + (await sha256Hex(stableStringify({ kty: signingPublicJwk.kty,
+    crv: signingPublicJwk.crv, x: signingPublicJwk.x, y: signingPublicJwk.y,
+    kid: signingPublicJwk.kid, alg: signingPublicJwk.alg, use: signingPublicJwk.use }))).slice(0, 32);
+  assert.notEqual(legacyId, await deriveInstanceId(signingPublicJwk));
+  const saved = { ...original, signingPublicJwk, instanceId: legacyId, updatedAt: original.createdAt };
+  await storage.remove(`${prefix}instance-key:${original.instanceId}`);
+  await storage.set(`${prefix}instance-key:${legacyId}`, saved);
+  await storage.set(`${prefix}active-instance:current`, { v: 1, instanceId: legacyId, updatedAt: original.createdAt });
+  const before = (await storage.keys("")).sort();
+  const restored = await makeAuthClient({ storage }).client.ensureInstance();
+  assert.deepEqual(restored, saved);
+  assert.deepEqual((await storage.keys("")).sort(), before);
+});

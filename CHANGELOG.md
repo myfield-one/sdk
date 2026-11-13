@@ -3,6 +3,7 @@
 ## 0.9.2-alpha.1 (unreleased)
 
 - Separate instance key, proof and session internals; preserve APIs and stored records.
+  Derive instance IDs from public key material only.
 - Add Remote index/feed queries, paged version history, ancestry evidence and
   change notifications.
 - Add Instance `resume()`, `connect()`, `disconnect()` and state events, plus

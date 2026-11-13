@@ -26,16 +26,13 @@ export async function createInstanceKey(): Promise<AuthInstance> {
   };
 }
 
-async function deriveInstanceId(signingPublicJwk: JsonWebKey): Promise<string> {
-  const digest = await sha256Hex(stableStringify(jwkCore(signingPublicJwk)));
+export async function deriveInstanceId(signingPublicJwk: JsonWebKey): Promise<string> {
+  const core = {
+    kty: String(signingPublicJwk.kty || ""),
+    crv: String(signingPublicJwk.crv || ""),
+    x: String(signingPublicJwk.x || ""),
+    y: String(signingPublicJwk.y || ""),
+  };
+  const digest = await sha256Hex(stableStringify(core));
   return `inst_${digest.slice(0, 32)}`;
-}
-
-function jwkCore(jwk: JsonWebKey): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const key of ["kty", "crv", "x", "y", "kid", "alg", "use"] as const) {
-    const value = (jwk as Record<string, unknown>)[key];
-    if (typeof value === "string") out[key] = value;
-  }
-  return out;
 }
