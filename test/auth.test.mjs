@@ -204,7 +204,6 @@ for (const failedRoute of ["instance-challenge", "instance-session"]) {
   });
 }
 
-
 test("restoring an existing identity preserves its saved ID even with annotated public JWK", async () => {
   const { deriveInstanceId } = await import("../src/auth/keys.ts");
   const { sha256Hex, stableStringify } = await import("../src/internal/encoding.ts");
