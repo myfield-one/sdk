@@ -21,7 +21,8 @@ export {
 } from "./facade.ts";
 export { NotConnectedError } from "./errors.ts";
 export { OfflineError } from "./bucket/transport.ts";
-export type { RemoteBucket, VersionMeta, CurrentVersion, ObjectVersion, CommitInput, CommitResult } from "./remote/bucket.ts";
+export type { RemoteBucket, VersionMeta, CurrentVersion, ObjectVersion, CommitInput, CommitResult,
+  PageOptions, VersionHistory, FeedHint, FeedPage, BucketIndex } from "./remote/bucket.ts";
 export type { RequestOptions } from "./remote/http.ts";
 export { ClientError } from "./errors.ts";
 export type { ClientErrorOptions } from "./errors.ts";

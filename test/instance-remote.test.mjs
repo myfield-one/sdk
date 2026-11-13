@@ -100,6 +100,10 @@ test("initialization is inert, selects same-named bucket and validates namespace
   t.after(() => stop(b));
   assert.equal(a.remote.getBucket(), a.remote.getBucket());
   await assert.rejects(a.remote.getBucket().getCurrent("note"), code("NOT_AUTHORIZED"));
+  await assert.rejects(a.remote.getBucket().getIndex(), code("NOT_AUTHORIZED"));
+  await assert.rejects(a.remote.getBucket().listFeed(), code("NOT_AUTHORIZED"));
+  await assert.rejects(a.remote.getBucket().listVersions("note", "v1"), code("NOT_AUTHORIZED"));
+  await assert.rejects(a.remote.getBucket().watchFeed(), code("NOT_AUTHORIZED"));
   await assert.rejects(a.connect({ authBase: "https://wrong.example/auth/" }), code("INVALID_INPUT"));
   assert.throws(() => a.remote.getBucket("other"), code("INVALID_INPUT"));
   assert.equal(opens, 0); assert.equal(env.calls.length, 0); assert.equal(env.opened.length, 0);
@@ -653,4 +657,142 @@ test("disconnect after redirect/reload clears persisted pending and rejects the 
   assert.equal(await instance.resume(), "disconnected");
   assert.equal(await auth.handleCallback(callbackUrl), null);
   assert.equal((await env.auth.keys("instance:app.example.com:context:")).length, 0);
+});
+
+
+test("Instance forwards discovery methods using the authorized remote bucket", async t => {
+  const env = browser(t), instance = env.instance();
+  const connecting = instance.connect(); await env.approve({ remoteBucketId: "remote.example.com" }); await connecting;
+  const remote = instance.remote.getBucket();
+  env.setHandler(call => {
+    assert.ok(call.url.pathname.startsWith("/v1/api/sync/buckets/remote.example.com/"));
+    if (call.url.pathname.endsWith("objects:index")) return Response.json({ bucketId: "remote.example.com", objects: [], feedCursor: null, hasMoreFeed: true });
+    if (call.url.pathname.endsWith("/feed")) return Response.json({ entries: [], cursor: "", hasMore: false });
+    return Response.json({ objectId: "note", versionId: "v1", parentVersionIds: [], history: ["v1"], nextCursor: null });
+  });
+  const index = await remote.getIndex();
+  assert.equal((await remote.listFeed({ cursor: index.feedCursor })).cursor, "");
+  assert.deepEqual((await remote.listVersions("note", "v1")).history, ["v1"]);
+});
+
+for (const [status, errorCode] of [[401, "TOKEN_REVOKED"], [403, "GRANT_REVOKED"], [403, "GRANT_CAPABILITY_MISMATCH"]])
+test(`stream ${status} ${errorCode} respects Instance authorization classification`, async t => {
+  const env = browser(t), instance = env.instance();
+  const connecting = instance.connect(); await env.approve(); await connecting;
+  env.setHandler(() => Response.json({ code: errorCode }, { status }));
+  const unauthorized = errorCode !== "GRANT_CAPABILITY_MISMATCH";
+  await assert.rejects(instance.remote.getBucket().watchFeed(), error => error.code === (unauthorized ? "NOT_AUTHORIZED" : errorCode) && error.status === status);
+  assert.equal(instance.state, unauthorized ? "disconnected" : "connected");
+  assert.equal(env.opened.length, 1);
+});
+
+test("disconnect aborts an active stream without emitting buffered stale hints", async t => {
+  const env = browser(t), instance = env.instance();
+  const connecting = instance.connect(); await env.approve(); await connecting;
+  env.setHandler(() => new Response(new ReadableStream({ start(controller) {
+    controller.enqueue(new TextEncoder().encode('event: sync-ready\ndata: {}\n\nevent: sync-feed\ndata: {"objectId":"note","versionId":"v1"}\n\n'));
+  } }), { headers: { "content-type": "text/event-stream" } }));
+  const stream = await instance.remote.getBucket().watchFeed();
+  await instance.disconnect();
+  await assert.rejects(stream.next(), error => error.name === "AbortError");
+  assert.equal(instance.state, "disconnected");
+});
+
+test("a late stream authorization failure cannot invalidate a reconnected Instance", async t => {
+  const env = browser(t), instance = env.instance();
+  const connecting = instance.connect(); await env.approve(); await connecting;
+  const gate = deferred();
+  env.setHandler(() => gate.promise);
+  const pending = instance.remote.getBucket().watchFeed();
+  await until(() => env.calls.at(-1).url.pathname.endsWith("/feed/stream"));
+  await instance.disconnect();
+  env.resetHandler();
+  const reconnecting = instance.connect();
+  await until(() => env.opened.length === 2 && env.opened.at(-1).location.href.includes("authRequest"));
+  await env.approve(); await reconnecting;
+  gate.resolve(Response.json({ code: "GRANT_REVOKED" }, { status: 403 }));
+  await assert.rejects(pending, error => error.name === "AbortError");
+  assert.equal(instance.state, "connected");
+});
+
+for (const confirmed of [true, false])
+test(`parsed commit ${confirmed ? "success" : "invalid acknowledgement"} survives a concurrent disconnect`, async t => {
+  const env = browser(t), instance = env.instance();
+  const connecting = instance.connect(); await env.approve(); await connecting;
+  let disconnected;
+  const acknowledgement = Object.defineProperty({}, "ok", { enumerable: true, get() {
+    disconnected ??= instance.disconnect();
+    return confirmed ? true : undefined;
+  } });
+  env.setHandler(() => {
+    const response = new Response("{}", { headers: { "content-type": "application/json" } });
+    response.json = async () => acknowledgement;
+    return response;
+  });
+  const committing = instance.remote.getBucket().commit({
+    meta: { objectId: "note", versionId: "v1", parentVersionIds: [] },
+    payload: new Uint8Array([42]), expectedHeadVersionId: null,
+  });
+  try {
+    if (confirmed) assert.equal(await committing, acknowledgement);
+    else await assert.rejects(committing, code("INVALID_RESPONSE"));
+  } finally { await disconnected; }
+  assert.equal(instance.state, "disconnected");
+});
+
+
+test("closing an Instance stream before iteration releases the subscription", async t => {
+  const env = browser(t), instance = env.instance();
+  const connecting = instance.connect(); await env.approve(); await connecting;
+  let cancelled = 0;
+  const body = new ReadableStream({ start(controller) {
+    controller.enqueue(new TextEncoder().encode('event: sync-ready\ndata: {}\n\n'));
+  }, cancel() { cancelled++; } });
+  env.setHandler(() => new Response(body, { headers: { "content-type": "text/event-stream" } }));
+  const stream = await instance.remote.getBucket().watchFeed();
+  await stream.return();
+  assert.equal(cancelled, 1); assert.equal(body.locked, false);
+  assert.equal(instance.state, "connected");
+});
+
+test("disconnect while awaiting subscription rejects with AbortError", async t => {
+  const env = browser(t), instance = env.instance();
+  const connecting = instance.connect(); await env.approve(); await connecting;
+  let body;
+  env.setHandler(call => {
+    body = new ReadableStream({ start(controller) {
+      call.signal.addEventListener("abort", () => controller.error(call.signal.reason), { once: true });
+    } });
+    return new Response(body, { headers: { "content-type": "text/event-stream" } });
+  });
+  const opening = instance.remote.getBucket().watchFeed();
+  const rejected = assert.rejects(opening, error => error.name === "AbortError");
+  await until(() => Boolean(body)); await tick();
+  await instance.disconnect(); await rejected;
+  assert.equal(body.locked, false); assert.equal(instance.state, "disconnected");
+});
+
+for (const mode of ["asyncDispose", "await using"])
+test(`${mode} closes an Instance subscription before iteration`, { skip: typeof Symbol.asyncDispose !== "symbol" }, async t => {
+  let dispose;
+  if (mode === "await using") {
+    const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+    try { dispose = new AsyncFunction("stream", "await using subscription = stream;"); }
+    catch { t.skip("Runtime does not support await using syntax"); return; }
+  } else dispose = async stream => {
+    assert.equal(await stream[Symbol.asyncDispose](), undefined);
+    await stream[Symbol.asyncDispose]();
+  };
+  const env = browser(t), instance = env.instance();
+  const connecting = instance.connect(); await env.approve(); await connecting;
+  let cancelled = 0;
+  const body = new ReadableStream({ start(controller) {
+    controller.enqueue(new TextEncoder().encode('event: sync-ready\ndata: {}\n\n'));
+  }, cancel() { cancelled++; } });
+  env.setHandler(() => new Response(body, { headers: { "content-type": "text/event-stream" } }));
+  const stream = await instance.remote.getBucket().watchFeed();
+  try { await dispose(stream); }
+  finally { await stream.return(); }
+  assert.equal(cancelled, 1); assert.equal(body.locked, false);
+  assert.equal(instance.state, "connected");
 });
