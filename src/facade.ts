@@ -27,6 +27,8 @@ import { BucketTransport, OfflineError } from "./bucket/transport.ts";
 import { createInstanceAuthClient, isValidBucketId, type AuthCallbackResult, type InstanceAuthClient } from "./auth/instance.ts";
 import { ClientError, NotConnectedError } from "./errors.ts";
 import { randomId } from "./internal/encoding.ts";
+import { resolveAppId } from "./auth/identifiers.ts";
+import type { InstanceKey } from "./auth/keys.ts";
 
 import { createInstanceConnection } from "./remote/connection.ts";
 import type { RemoteBucket } from "./remote/bucket.ts";
@@ -41,6 +43,7 @@ const RESERVED_PREFIX = "~";
 export type CreateInstanceOptions = {
   namespace?: string;
   storage?: "indexeddb" | "memory";
+  appId?: string;
 };
 
 export type BucketState = "disconnected" | "connecting" | "connected";
@@ -81,6 +84,10 @@ export type Instance = {
   readonly namespace: string;
   readonly remote: { getBucket(): RemoteBucket };
   readonly state: BucketState;
+  getKey(): Promise<InstanceKey | null>;
+  createKey(): Promise<InstanceKey>;
+  importKey(key: InstanceKey): Promise<void>;
+  removeKey(): Promise<void>;
   resume(): Promise<BucketState>;
   connect(): Promise<BucketState>;
   disconnect(): Promise<void>;
@@ -90,14 +97,18 @@ export type Instance = {
 
 export const instanceTestCleanup = new WeakMap<Instance, () => void>();
 
-export function createInstance(namespace: string): Instance;
+export function createInstance(appId: string): Instance;
 export function createInstance(options?: CreateInstanceOptions): Instance;
 export function createInstance(input: string | CreateInstanceOptions = {}, ...extra: unknown[]): Instance {
-  if (typeof input === "string" && extra.length) throw new ClientError("INVALID_INPUT", "createInstance accepts a namespace or an options object, without additional arguments");
-  const options: CreateInstanceOptions = typeof input === "string" ? { namespace: input } : input;
+  if (typeof input === "string" && extra.length) throw new ClientError("INVALID_INPUT", "createInstance accepts an appId or an options object, without additional arguments");
+  const options: CreateInstanceOptions = typeof input === "string" ? { appId: input } : input;
   if (!options || typeof options !== "object" || Array.isArray(options)) throw new ClientError("INVALID_INPUT", "Instance options are required");
+  if (["authStorage", "dbName", "storeName"].some(key => key in options)) throw new ClientError("INVALID_INPUT", "Custom database configuration is not supported");
   if ("authUrl" in options) throw new ClientError("INVALID_INPUT", "Custom authorization URLs are not supported by the Instance API");
-  const namespace = normalizeNamespace(typeof input === "string" || options.namespace === undefined ? options.namespace : String(options.namespace).trim());
+  const explicitAppId = options.appId === undefined ? undefined : resolveAppId(options.appId);
+  let resolvedAppId = explicitAppId;
+  const getAppId = () => resolvedAppId ??= resolveAppId();
+  const namespace = normalizeNamespace(options.namespace === undefined ? explicitAppId : String(options.namespace).trim());
   const storageKind = options.storage || "indexeddb";
 
   const baseAdapter =
@@ -109,7 +120,10 @@ export function createInstance(input: string | CreateInstanceOptions = {}, ...ex
   // One handle per bucket id: separate facades over the same storage would
   // split event listeners and duplicate clients/clocks/debounce timers.
   const buckets = new Map<string, Bucket>();
-  const connection = createInstanceConnection({ namespace, data: baseAdapter, auth: authAdapter, hasLegacyBucket: () => buckets.has(namespace), persistent: storageKind !== "memory" });
+  const connection = createInstanceConnection({ getAppId, data: baseAdapter, auth: authAdapter,
+    hasLegacyBucket: () => { try { return buckets.has(getAppId()); } catch { return false; } },
+    hasActiveLocalConnection: () => [...buckets.values()].some(bucket => bucket.state !== "disconnected"),
+    persistent: storageKind !== "memory" });
   let disposed = false;
 
   const instance: Instance = {
@@ -119,6 +133,10 @@ export function createInstance(input: string | CreateInstanceOptions = {}, ...ex
     resume: connection.resume,
     on: connection.on,
     connect: connection.connect,
+    getKey: connection.getKey,
+    createKey: connection.createKey,
+    importKey: connection.importKey,
+    removeKey: connection.removeKey,
     disconnect: connection.disconnect,
     createBucket(bucketOptions) {
       if (disposed) throw new ClientError("DISPOSED", "Instance has been disposed");
@@ -127,9 +145,9 @@ export function createInstance(input: string | CreateInstanceOptions = {}, ...ex
       if (!isValidBucketId(bucketId)) throw new Error("invalid bucketId");
       const existing = buckets.get(bucketId);
       if (existing) return existing;
-      const bucket = createBucketFacade({ namespace, bucketId, dataAdapter: baseAdapter, authAdapter });
+      const bucket = createBucketFacade({ namespace, bucketId, dataAdapter: baseAdapter, authAdapter, getAppId });
       buckets.set(bucketId, bucket);
-      if (bucketId === namespace) connection.block();
+      try { if (bucketId === getAppId()) connection.block(); } catch {}
       return bucket;
     },
   };
@@ -148,6 +166,7 @@ type BucketDeps = {
   bucketId: string;
   dataAdapter: StorageAdapter;
   authAdapter: StorageAdapter;
+  getAppId(): string;
 };
 
 function createBucketFacade(deps: BucketDeps): Bucket {
@@ -473,7 +492,7 @@ function createBucketFacade(deps: BucketDeps): Bucket {
     const authPageUrl = normalizeAuthBase(endpoints.authBase);
     authPageOrigin = new URL(authPageUrl, window.location.href).origin;
     const baseOptions = {
-      appId: new URL(origin).hostname,
+      appId: deps.getAppId(),
       apiBase: endpoints.apiBase,
       redirectUri: origin + window.location.pathname,
       origin,
@@ -763,6 +782,9 @@ function normalizeNamespace(value: string | undefined): string {
 
 function prefixedAdapter(adapter: StorageAdapter, prefix: string): StorageAdapter {
   return {
+    ...(adapter.removePrefix ? { removePrefix: (keyPrefix: string) => adapter.removePrefix!(`${prefix}${keyPrefix}`) } : {}),
+    ...(adapter.insertIfEmpty ? { insertIfEmpty: (keyPrefix: string, entries: { key: string; value: unknown }[]) =>
+      adapter.insertIfEmpty!(`${prefix}${keyPrefix}`, entries.map(entry => ({ ...entry, key: `${prefix}${entry.key}` }))) } : {}),
     get: (key) => adapter.get(`${prefix}${key}`),
     set: (key, value) => adapter.set(`${prefix}${key}`, value),
     remove: (key) => adapter.remove(`${prefix}${key}`),

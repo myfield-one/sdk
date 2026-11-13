@@ -9,48 +9,25 @@
 // The /auth fragment wire format is frozen as-is, including its vestigial
 // OAuth-shaped fields; this module hides it from apps entirely.
 
-import {
-  b64urlToBytes,
-  bytesToB64url,
-  bytesToHex,
-  randomId,
-  stableStringify,
-  utf8Encode,
-} from "../internal/encoding.ts";
-import { unwrapBucketKeys, type BucketKeyGrantEnvelope, type BucketKeys } from "../bucket/keys.ts";
+import { bytesToHex, randomId } from "../internal/encoding.ts";
+import { unwrapBucketKeys } from "../bucket/keys.ts";
 import { createIndexedDbStorageAdapter, type StorageAdapter } from "../bucket/store.ts";
-import { createInstanceKey, type AuthInstance } from "./keys.ts";
+import type { AuthInstance } from "./keys.ts";
+import { createInstanceKeyStore } from "./store.ts";
+import { ClientError } from "../errors.ts";
+import type { AuthCapability, InstanceAuthContext, BucketAccess, AuthCallbackResult, BucketAccessGrant } from "./types.ts";
+import { buildAuthRequestFragment, parseEncryptedAuthAuthorizationResultFragment, decryptEncryptedAuthAuthorizationResult,
+  normalizeBucketAccessGrant, type StoredAuthAuthorizationResult, type EncryptedAuthAuthorizationResultEnvelope } from "./authorization.ts";
+import { bucketResourceId, parseBucketResourceId, requireValidBucketId, isValidMfid, resolveAppId } from "./identifiers.ts";
 import { createSessionClient } from "../remote/session.ts";
 import { createSession, type CloudSessionCredential } from "./session.ts";
 
+export type { AuthCapability, InstanceAuthContext, BucketAccess, AuthCallbackResult, BucketAccessGrant } from "./types.ts";
+export { decryptEncryptedAuthAuthorizationResult, normalizeBucketAccessGrant } from "./authorization.ts";
+export { bucketResourceId, isValidBucketId } from "./identifiers.ts";
 export type { AuthInstance } from "./keys.ts";
 export type { CloudSessionCredential } from "./session.ts";
 export { signInstanceChallenge } from "./proof.ts";
-
-export type AuthCapability = "read" | "write";
-
-export type InstanceAuthContext = {
-  v: 1;
-  mfid: string;
-  resourceId: string;
-  remoteResourceId?: string;
-  resourceApiUrl?: string;
-  instanceId: string;
-  requestId: string;
-  authorizedAt: string;
-  bucketAccessGrant?: BucketAccessGrant;
-};
-
-export type BucketAccess = {
-  mfid: string;
-  instanceId: string;
-  bucketId: string;
-  resourceId: string;
-  resourceApiUrl?: string;
-  capabilities: AuthCapability[];
-  grantRecordId: string;
-  keys: BucketKeys;
-};
 
 export type InstanceAuthClientOptions = {
   appId?: string;
@@ -63,15 +40,6 @@ export type InstanceAuthClientOptions = {
   fetchImpl?: typeof fetch;
 };
 
-export type AuthCallbackResult = {
-  requestId: string;
-  state: string;
-  result: "approved" | "denied" | "error";
-  resourceId?: string;
-  error?: string;
-  errorDescription?: string;
-};
-
 export type InstanceAuthClient = {
   ensureInstance(): Promise<AuthInstance>;
   authorize(request: { bucketId: string }): Promise<void>;
@@ -80,47 +48,6 @@ export type InstanceAuthClient = {
   getSession(bucketId: string, options?: { forceRefresh?: boolean }): Promise<CloudSessionCredential>;
   getBucketAccess(bucketId: string): Promise<BucketAccess>;
   clearContext(bucketId: string): Promise<void>;
-};
-
-export type BucketAccessGrant = {
-  v: 1;
-  grantRecordId: string;
-  mfid: string;
-  resourceId: string;
-  instanceId: string;
-  issuedAt: string;
-  keyId: string;
-  capabilities: AuthCapability[];
-  envelope: BucketKeyGrantEnvelope;
-};
-
-type StoredAuthAuthorizationResult = {
-  v: 1;
-  requestId: string;
-  state: string;
-  result: "approved";
-  mfid: string;
-  resourceId: string;
-  instanceId: string;
-  createdAt: string;
-  resourceApiUrl?: string;
-  bucketAccessGrant?: BucketAccessGrant;
-  expiresAt?: string;
-};
-
-type EncryptedAuthAuthorizationResultEnvelope = {
-  v: 1;
-  typ: "auth.authorization-result.envelope.v1";
-  alg: "ECDH-HKDF-SHA-256/AES-GCM-256";
-  requestId: string;
-  state: string;
-  resourceId: string;
-  instanceId: string;
-  ephemeralPublicJwk: JsonWebKey;
-  salt: string;
-  iv: string;
-  aad: string;
-  ciphertext: string;
 };
 
 type PendingInstanceAuthRequest = {
@@ -141,9 +68,6 @@ type InstanceAuthCallbackPointer = {
   createdAt: string;
 };
 
-type StoredAuthInstance = AuthInstance & { updatedAt: string };
-type ActiveInstancePointer = { v: 1; instanceId: string; updatedAt: string };
-
 type StoredCloudSessionCredential = {
   v: 1;
   mfid: string;
@@ -154,7 +78,6 @@ type StoredCloudSessionCredential = {
 };
 
 const AUTH_REQUEST_TTL_MS = 10 * 60 * 1000;
-const AUTH_CALLBACK_FRAGMENT_PARAM = "mf_auth_result";
 const DEFAULT_AUTH_IDB_NAME = "mf-sdk-auth-v1";
 const BUCKET_ACCESS_CACHE_TTL_MS = 60_000;
 const INSTANCE_SESSION_USABLE_WINDOW_MS = 2 * 60 * 1000;
@@ -162,8 +85,7 @@ const INSTANCE_SESSION_BEST_EFFORT_REFRESH_WINDOW_MS = 60 * 60 * 1000;
 const FIXED_CAPABILITIES: AuthCapability[] = ["read", "write"];
 
 export function createInstanceAuthClient(options: InstanceAuthClientOptions = {}): InstanceAuthClient {
-  let instance: AuthInstance | null = null;
-  const appId = normalizeInstanceAppId(options.appId);
+  const appId = resolveAppId(options.appId);
   let mfid = "";
   let currentResourceId = "";
   let currentSession: { resourceId: string; credential: CloudSessionCredential } | null = null;
@@ -173,63 +95,11 @@ export function createInstanceAuthClient(options: InstanceAuthClientOptions = {}
   const sessions = createSessionClient((path, body) => postJson(fetchImpl, options.apiBase, path, body));
   const bucketAccessCache = new Map<string, { access: BucketAccess; expiresAt: number }>();
 
-  const activeInstanceKey = () => `instance:${seg(appId)}:active-instance:current`;
-  const instanceKey = (instanceId: string) => `instance:${seg(appId)}:instance-key:${seg(instanceId)}`;
-  const pendingAuthKey = (resourceId: string, instanceId: string) => `instance:${seg(appId)}:pending-auth:${seg(resourceId)}:${seg(instanceId)}`;
-  const callbackPointerKey = (requestId: string) => `instance:${seg(appId)}:callback-pointer:${seg(requestId)}`;
-  const contextKey = (resourceId: string, instanceId: string) => `instance:${seg(appId)}:context:${seg(resourceId)}:${seg(instanceId)}`;
-  const sessionKey = (resourceId: string, instanceId: string) => `instance:${seg(appId)}:session:${seg(resourceId)}:${seg(instanceId)}`;
-
-  function isStoredAuthInstance(value: StoredAuthInstance | null, instanceId?: string): value is StoredAuthInstance {
-    return (
-      !!value &&
-      value.v === 1 &&
-      isValidInstanceId(value.instanceId) &&
-      (!instanceId || value.instanceId === instanceId) &&
-      value.signingPrivateKey instanceof CryptoKey &&
-      value.wrappingPrivateKey instanceof CryptoKey
-    );
-  }
-
-  async function readStoredInstance(instanceId: string): Promise<StoredAuthInstance | null> {
-    const stored = await storage.get<StoredAuthInstance>(instanceKey(instanceId));
-    return isStoredAuthInstance(stored, instanceId) ? stored : null;
-  }
-
-  async function writeStoredInstance(authInstance: AuthInstance): Promise<StoredAuthInstance> {
-    const existing = await readStoredInstance(authInstance.instanceId);
-    const stored: StoredAuthInstance = {
-      ...authInstance,
-      updatedAt: new Date().toISOString(),
-      createdAt: authInstance.createdAt || existing?.createdAt || new Date().toISOString(),
-    };
-    await storage.set(instanceKey(authInstance.instanceId), stored);
-    const verified = await readStoredInstance(authInstance.instanceId);
-    if (!verified) throw new Error("auth instance write did not persist keys");
-    await storage.set(activeInstanceKey(), { v: 1, instanceId: authInstance.instanceId, updatedAt: new Date().toISOString() } satisfies ActiveInstancePointer);
-    instance = verified;
-    return verified;
-  }
-
-  async function readActiveStoredInstance(): Promise<StoredAuthInstance | null> {
-    const active = await storage.get<ActiveInstancePointer>(activeInstanceKey());
-    if (!active || active.v !== 1 || !isValidInstanceId(active.instanceId)) return null;
-    return readStoredInstance(active.instanceId);
-  }
-
-  async function ensureStoredInstance(): Promise<StoredAuthInstance> {
-    if (instance) {
-      const stored = await readStoredInstance(instance.instanceId);
-      if (stored) return stored;
-      return writeStoredInstance(instance);
-    }
-    const active = await readActiveStoredInstance();
-    if (active) {
-      instance = active;
-      return active;
-    }
-    return writeStoredInstance(await createInstanceKey());
-  }
+  const keyStore = createInstanceKeyStore(storage, appId);
+  const { pending: pendingAuthKey, callback: callbackPointerKey, context: contextKey, session: sessionKey } = keyStore.keys;
+  const readStoredInstance = keyStore.read;
+  const readActiveStoredInstance = keyStore.active;
+  const ensureStoredInstance = keyStore.ensure;
 
   async function readContext(resourceId: string): Promise<InstanceAuthContext | null> {
     if (!parseBucketResourceId(resourceId)) return null;
@@ -248,7 +118,6 @@ export function createInstanceAuthClient(options: InstanceAuthClientOptions = {}
     }
     mfid = context.mfid;
     currentResourceId = context.resourceId;
-    instance = authInstance;
     return context;
   }
 
@@ -411,6 +280,9 @@ export function createInstanceAuthClient(options: InstanceAuthClientOptions = {}
         const remoteResourceId = stored.bucketAccessGrant?.resourceId || stored.resourceId;
         mfid = stored.mfid;
         currentResourceId = stored.resourceId;
+        if ((await readActiveStoredInstance())?.instanceId !== authInstance.instanceId) {
+          throw new ClientError("IDENTITY_MISMATCH", "Active instance changed during authorization");
+        }
         await storage.set(contextKey(stored.resourceId, stored.instanceId), {
           v: 1,
           mfid: stored.mfid,
@@ -422,7 +294,6 @@ export function createInstanceAuthClient(options: InstanceAuthClientOptions = {}
           authorizedAt: new Date().toISOString(),
           ...(stored.bucketAccessGrant ? { bucketAccessGrant: stored.bucketAccessGrant } : {}),
         } satisfies InstanceAuthContext);
-        await writeStoredInstance(authInstance);
         if (currentSession?.resourceId === remoteResourceId) currentSession = null;
         await storage.remove(sessionKey(remoteResourceId, stored.instanceId));
         bucketAccessCache.clear();
@@ -479,237 +350,6 @@ export function createInstanceAuthClient(options: InstanceAuthClientOptions = {}
   };
 }
 
-type AuthRequestFields = {
-  clientId: string;
-  requestId: string;
-  state: string;
-  redirectUri: string;
-  origin: string;
-  resourceId: string;
-  capabilities: AuthCapability[];
-  instanceId: string;
-  instanceSigningPublicJwk: JsonWebKey;
-  instanceWrappingPublicJwk: JsonWebKey;
-  createdAt: string;
-};
-
-function buildAuthRequestFragment(request: AuthRequestFields): string {
-  if (!request.requestId || !request.state) throw new Error("auth request state required");
-  if (!isValidInstanceId(request.instanceId)) throw new Error("invalid instanceId");
-  if (!isPublicP256EcJwk(request.instanceSigningPublicJwk)) throw new Error("instanceSigningPublicJwk required");
-  if (!isPublicP256EcJwk(request.instanceWrappingPublicJwk)) throw new Error("instanceWrappingPublicJwk required");
-  const redirect = new URL(request.redirectUri);
-  const origin = new URL(request.origin);
-  if (redirect.origin !== origin.origin) throw new Error("redirectUri origin mismatch");
-  const wire = {
-    response_type: "code",
-    client_id: request.clientId,
-    redirect_uri: request.redirectUri,
-    state: request.state,
-    scope: request.capabilities.join(" "),
-    resource_id: request.resourceId,
-    mf_v: 1,
-    mf_auth_mode: "v1",
-    mf_request_id: request.requestId,
-    mf_instance_id: request.instanceId,
-    mf_instance_signing_jwk: request.instanceSigningPublicJwk,
-    mf_instance_wrapping_jwk: request.instanceWrappingPublicJwk,
-    mf_issued_at: request.createdAt,
-  };
-  return `#authRequest=${bytesToB64url(utf8Encode(stableStringify(wire)))}`;
-}
-
-function parseEncryptedAuthAuthorizationResultFragment(fragmentOrUrl: string): EncryptedAuthAuthorizationResultEnvelope | null {
-  const input = String(fragmentOrUrl || "");
-  const rawFragment = input.includes("#") ? input.slice(input.indexOf("#") + 1) : input.replace(/^#/, "");
-  if (!rawFragment) return null;
-  const encoded = new URLSearchParams(rawFragment).get(AUTH_CALLBACK_FRAGMENT_PARAM);
-  if (!encoded) return null;
-  const envelope = JSON.parse(new TextDecoder().decode(b64urlToBytes(encoded))) as Partial<EncryptedAuthAuthorizationResultEnvelope> | null;
-  if (
-    !envelope ||
-    envelope.v !== 1 ||
-    envelope.typ !== "auth.authorization-result.envelope.v1" ||
-    envelope.alg !== "ECDH-HKDF-SHA-256/AES-GCM-256" ||
-    typeof envelope.requestId !== "string" ||
-    typeof envelope.state !== "string" ||
-    !parseBucketResourceId(envelope.resourceId) ||
-    !isValidInstanceId(envelope.instanceId || "") ||
-    !isPublicP256EcJwk(envelope.ephemeralPublicJwk) ||
-    typeof envelope.salt !== "string" ||
-    typeof envelope.iv !== "string" ||
-    typeof envelope.aad !== "string" ||
-    typeof envelope.ciphertext !== "string"
-  ) {
-    throw new Error("auth callback result fragment invalid");
-  }
-  return envelope as EncryptedAuthAuthorizationResultEnvelope;
-}
-
-export async function decryptEncryptedAuthAuthorizationResult(input: {
-  envelope: EncryptedAuthAuthorizationResultEnvelope;
-  instanceWrappingPrivateKey: CryptoKey;
-  expectedRequestId?: string;
-  expectedState?: string;
-  expectedResourceId?: string;
-  expectedInstanceId?: string;
-}): Promise<StoredAuthAuthorizationResult> {
-  const { envelope } = input;
-  if (
-    (input.expectedRequestId && envelope.requestId !== input.expectedRequestId) ||
-    (input.expectedState && envelope.state !== input.expectedState) ||
-    (input.expectedResourceId && envelope.resourceId !== input.expectedResourceId) ||
-    (input.expectedInstanceId && envelope.instanceId !== input.expectedInstanceId)
-  ) {
-    throw new Error("auth callback result mismatch");
-  }
-  const ephemeralPublic = await crypto.subtle.importKey("jwk", envelope.ephemeralPublicJwk, { name: "ECDH", namedCurve: "P-256" }, false, []);
-  const sharedBits = await crypto.subtle.deriveBits({ name: "ECDH", public: ephemeralPublic }, input.instanceWrappingPrivateKey, 256);
-  const material = await crypto.subtle.importKey("raw", sharedBits, "HKDF", false, ["deriveKey"]);
-  const wrappingKey = await crypto.subtle.deriveKey(
-    { name: "HKDF", hash: "SHA-256", salt: b64urlToBytes(envelope.salt) as BufferSource, info: utf8Encode(envelope.aad) },
-    material,
-    { name: "AES-GCM", length: 256 },
-    false,
-    ["decrypt"]
-  );
-  const plaintext = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: b64urlToBytes(envelope.iv) as BufferSource, additionalData: utf8Encode(envelope.aad) },
-    wrappingKey,
-    b64urlToBytes(envelope.ciphertext) as BufferSource
-  );
-  const result = normalizeAuthAuthorizationResult(JSON.parse(new TextDecoder().decode(plaintext)), envelope.requestId);
-  if (
-    !result ||
-    result.state !== envelope.state ||
-    result.resourceId !== envelope.resourceId ||
-    result.instanceId !== envelope.instanceId ||
-    (input.expectedState && result.state !== input.expectedState) ||
-    (input.expectedResourceId && result.resourceId !== input.expectedResourceId) ||
-    (input.expectedInstanceId && result.instanceId !== input.expectedInstanceId)
-  ) {
-    throw new Error("auth callback result mismatch");
-  }
-  return result;
-}
-
-function normalizeAuthAuthorizationResult(value: unknown, expectedRequestId?: string): StoredAuthAuthorizationResult | null {
-  const row = value as Partial<StoredAuthAuthorizationResult> | null;
-  if (
-    !row ||
-    row.v !== 1 ||
-    row.result !== "approved" ||
-    typeof row.requestId !== "string" ||
-    (expectedRequestId && row.requestId !== expectedRequestId) ||
-    typeof row.state !== "string" ||
-    !isValidMfid(row.mfid || "") ||
-    !parseBucketResourceId(row.resourceId) ||
-    !isValidInstanceId(row.instanceId || "") ||
-    typeof row.createdAt !== "string"
-  ) {
-    return null;
-  }
-  if (row.expiresAt !== undefined) {
-    const expiresAt = Date.parse(String(row.expiresAt));
-    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) return null;
-  }
-  const resource = parseBucketResourceId(row.resourceId);
-  if (!resource) return null;
-  const bucketAccessGrant = normalizeBucketAccessGrant(row.bucketAccessGrant);
-  if (!bucketAccessGrant) return null;
-  if (bucketAccessGrant.mfid !== row.mfid || !parseBucketResourceId(bucketAccessGrant.resourceId) || bucketAccessGrant.instanceId !== row.instanceId) {
-    return null;
-  }
-  return {
-    v: 1,
-    requestId: row.requestId,
-    state: row.state,
-    result: "approved",
-    mfid: row.mfid!,
-    resourceId: resource.resourceId,
-    instanceId: row.instanceId!,
-    createdAt: row.createdAt,
-    ...(typeof row.resourceApiUrl === "string" && row.resourceApiUrl.trim() ? { resourceApiUrl: row.resourceApiUrl.trim() } : {}),
-    bucketAccessGrant,
-    ...(row.expiresAt ? { expiresAt: row.expiresAt } : {}),
-  };
-}
-
-export function normalizeBucketAccessGrant(value: unknown): BucketAccessGrant | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const row = value as Partial<BucketAccessGrant>;
-  const resource = parseBucketResourceId(row.resourceId);
-  const capabilities = normalizeCapabilities(row.capabilities);
-  if (
-    row.v !== 1 ||
-    !/^ar_[a-f0-9]{32}$/.test(String(row.grantRecordId || "")) ||
-    !isValidMfid(row.mfid) ||
-    !resource ||
-    !isValidInstanceId(row.instanceId) ||
-    !/^bk_[a-f0-9]{32}$/.test(String(row.keyId || "")) ||
-    capabilities.length < 1 ||
-    !isValidBucketKeyGrantEnvelope(row.envelope, row.instanceId, row.keyId)
-  ) {
-    return null;
-  }
-  return {
-    v: 1,
-    grantRecordId: row.grantRecordId!,
-    mfid: row.mfid!,
-    resourceId: resource.resourceId,
-    instanceId: row.instanceId!,
-    issuedAt: String(row.issuedAt || ""),
-    keyId: row.keyId!,
-    capabilities,
-    envelope: row.envelope as BucketKeyGrantEnvelope,
-  };
-}
-
-function isValidBucketKeyGrantEnvelope(value: unknown, instanceId?: string, keyId?: string): value is BucketKeyGrantEnvelope {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const row = value as Partial<BucketKeyGrantEnvelope>;
-  if (
-    row.kind !== "bucket-key" ||
-    !isValidBucketId(row.bucketId) ||
-    !/^bk_[a-f0-9]{32}$/.test(String(row.keyId || "")) ||
-    !isValidInstanceId(row.targetInstanceId) ||
-    row.wrapAlg !== "ECDH-HKDF-SHA-256/AES-GCM-256" ||
-    !isPublicP256EcJwk(row.targetWrappingPublicJwk) ||
-    !isPublicP256EcJwk(row.ephemeralPublicJwk) ||
-    typeof row.salt !== "string" ||
-    typeof row.iv !== "string" ||
-    typeof row.aad !== "string" ||
-    typeof row.ciphertext !== "string"
-  ) {
-    return false;
-  }
-  if (instanceId && row.targetInstanceId !== instanceId) return false;
-  if (keyId && row.keyId !== keyId) return false;
-  return true;
-}
-
-export function bucketResourceId(bucketId: string): string {
-  return `urn:myfield:bucket:${bucketId}`;
-}
-
-function parseBucketResourceId(resourceId: unknown): { resourceId: string; bucketId: string } | null {
-  const safe = typeof resourceId === "string" ? resourceId.trim() : "";
-  const prefix = "urn:myfield:bucket:";
-  if (!safe.startsWith(prefix)) return null;
-  const bucketId = safe.slice(prefix.length);
-  return isValidBucketId(bucketId) ? { resourceId: safe, bucketId } : null;
-}
-
-function normalizeCapabilities(input: unknown): AuthCapability[] {
-  if (!Array.isArray(input)) return [];
-  const allowed = new Set<AuthCapability>(["read", "write"]);
-  const result: AuthCapability[] = [];
-  for (const item of input) {
-    if (allowed.has(item as AuthCapability) && !result.includes(item as AuthCapability)) result.push(item as AuthCapability);
-  }
-  return result.sort();
-}
-
 async function postJson<T>(fetchImpl: typeof fetch, apiBase: string | undefined, path: string, body: unknown): Promise<T> {
   const res = await fetchImpl(`${apiBase || ""}${path}`, {
     method: "POST",
@@ -742,39 +382,6 @@ function shouldBestEffortRefreshSession(session: CloudSessionCredential): boolea
 function isFresh(createdAt: string): boolean {
   const created = Date.parse(createdAt);
   return Number.isFinite(created) && Date.now() - created <= AUTH_REQUEST_TTL_MS;
-}
-
-export function isValidBucketId(value: unknown): value is string {
-  const safe = typeof value === "string" ? value.trim() : "";
-  return /^[a-z0-9](?:[a-z0-9.-]{0,61}[a-z0-9])?$/.test(safe) && !safe.includes("..");
-}
-
-function requireValidBucketId(value: unknown): string {
-  if (!isValidBucketId(value)) throw new Error("invalid bucketId");
-  return value;
-}
-
-function isValidInstanceId(value: unknown): value is string {
-  return typeof value === "string" && /^inst_[a-f0-9]{32}$/.test(value);
-}
-
-function isValidMfid(value: unknown): value is string {
-  return typeof value === "string" && /^[a-f0-9]{32}$/.test(value);
-}
-
-function isPublicP256EcJwk(value: unknown): value is JsonWebKey {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const jwk = value as JsonWebKey;
-  return jwk.kty === "EC" && jwk.crv === "P-256" && typeof jwk.x === "string" && jwk.x.length > 0 && typeof jwk.y === "string" && jwk.y.length > 0;
-}
-
-function normalizeInstanceAppId(value: unknown): string {
-  const safe = typeof value === "string" ? value.trim() : "";
-  return isValidBucketId(safe) ? safe : "myfield.sdk";
-}
-
-function seg(value: string): string {
-  return encodeURIComponent(value);
 }
 
 function browserLocationHref(): string {

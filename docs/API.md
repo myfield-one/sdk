@@ -22,17 +22,16 @@ await bucket.connect();
 ## `createInstance`
 
 ```ts
-createInstance(namespace: string): Instance;
+createInstance(appId: string): Instance;
 createInstance(options?: {
-  namespace?: string;
+  appId?: string;
+  namespace?: string; // Existing storage scope.
   storage?: "indexeddb" | "memory";
 }): Instance;
 ```
 
-Defaults: namespace `"default"`, IndexedDB at `myfield-sdk:${namespace}` / `kv`.
-Use lowercase ASCII domain labels, at most 63 characters total. Keep existing names
-for data and 0.9.1 compatibility. The object form trims whitespace and also supports
-memory storage.
+`appId` defaults to the browser hostname. Use lowercase ASCII domain-form names,
+1–63 characters.
 
 ## `instance.createBucket(options)`
 
@@ -137,6 +136,24 @@ application-owned and is not a public SDK API concept.
   them; their `change` event fires after `list()` includes them.
 - Object ids and field names starting with `~` are reserved and rejected.
 
+## Instance Key API
+
+| Method | Behavior |
+| --- | --- |
+| `instance.getKey()` | Return the saved `InstanceKey`, or null. |
+| `instance.createKey()` | Generate, save and return an `InstanceKey`. |
+| `instance.importKey(key)` | Validate and save an existing key. |
+| `instance.removeKey()` | Remove the identity and dependent authorization. |
+
+[`InstanceKey`](../types/index.d.ts) contains instanceId, signing/wrapping public JWKs,
+nonextractable private CryptoKeys and createdAt.
+
+| Error | Meaning |
+| --- | --- |
+| `KEY_EXISTS` | Creation/import found an existing key, including the same ID. |
+| `INVALID_STATE` | Key changes require disconnected Instance and Local connections. |
+| `INVALID_INSTANCE_KEY` | Damaged records: getKey/connect reject; resume returns disconnected and reports the error through state. |
+
 ## Connection API
 
 ```ts
@@ -229,7 +246,7 @@ if (instance.state === "connected") {
 // Call instance.connect() from your Connect button.
 ```
 
-`getBucket()` returns the namespace's Remote handle. Resume or connect before using
+`getBucket()` returns the default bucket's Remote handle. Resume or connect before using
 it. Missing current objects return null; missing versions throw. `getVersion()`
 returns metadata and a payload Response; consume or cancel its body.
 

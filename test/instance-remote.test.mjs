@@ -337,7 +337,7 @@ test("disconnect waits for an already-started callback write and removes its res
     if (key.includes(":context:")) { entered.resolve(); await release.promise; }
     await env.auth.set(key, value);
   } };
-  const connection = createInstanceConnection({ namespace: env.namespace, data: env.data, auth, hasLegacyBucket: () => false });
+  const connection = createInstanceConnection({ getAppId: () => env.namespace, data: env.data, auth, hasLegacyBucket: () => false });
   t.after(() => connection.dispose());
   const connecting = connection.connect(); const failed = assert.rejects(connecting);
   await env.approve(); await entered.promise;
@@ -795,4 +795,279 @@ test(`${mode} closes an Instance subscription before iteration`, { skip: typeof 
   finally { await stream.return(); }
   assert.equal(cancelled, 1); assert.equal(body.locked, false);
   assert.equal(instance.state, "connected");
+});
+
+test("appId selects authorization independently from legacy storage scope", async t => {
+  const env = browser(t);
+  const instance = createInstance({ appId: "notes.example.com", namespace: "default" });
+  t.after(() => stop(instance));
+  const connecting = instance.connect();
+  const { wire } = await env.approve();
+  await connecting;
+  assert.equal(instance.namespace, "default");
+  assert.equal(wire.client_id, "notes.example.com");
+  assert.equal(wire.resource_id, "urn:myfield:bucket:notes.example.com");
+  const db = createIndexedDbStorageAdapter({ dbName: "myfield-sdk:default" });
+  assert.equal((await db.keys("auth:instance:notes.example.com:instance-key:")).length, 1);
+  assert.equal((await db.keys("auth:instance:app.example.com:")).length, 0);
+  assert.deepEqual(await db.get("meta:notes.example.com:endpoints"), {
+    authBase: "https://myfield.one/auth/", apiBase: "https://api.example.test",
+  });
+});
+
+test("no-argument initialization resumes existing hostname identity in the default database", async t => {
+  const env = browser(t);
+  const data = createIndexedDbStorageAdapter({ dbName: "myfield-sdk:default" });
+  const auth = { get: key => data.get(`auth:${key}`), set: (key, value) => data.set(`auth:${key}`, value),
+    remove: key => data.remove(`auth:${key}`), keys: async prefix => (await data.keys(`auth:${prefix}`)).map(key => key.slice(5)) };
+  let target;
+  const original = createInstanceAuthClient({ appId: "app.example.com", storage: auth,
+    origin: env.win.location.origin, redirectUri: env.win.location.href,
+    authPageUrl: "https://myfield.one/auth/", openAuthUrl: url => { target = url; } });
+  await original.authorize({ bucketId: "app.example.com" });
+  const wire = decodeAuthRequestFragment(target);
+  await original.handleCallback((await buildApprovedCallback(wire, env.win.location.href)).callbackUrl);
+  await data.set("meta:app.example.com:endpoints", { authBase: "https://myfield.one/auth/", apiBase: "https://api.example.test" });
+  const instance = createInstance(); t.after(() => stop(instance));
+  assert.equal(await instance.resume(), "connected");
+  assert.equal((await original.ensureInstance()).instanceId, wire.mf_instance_id);
+  assert.equal((await data.keys("auth:instance:app.example.com:instance-key:")).length, 1);
+  assert.equal(env.opened.length, 0);
+  assert.equal(await data.get("meta:actor"), null);
+});
+
+for (const hostname of ["[::1]", "", "x".repeat(64)]) {
+  test(`implicit invalid appId ${hostname || "empty"} is lazy and does not block Local CRUD`, async t => {
+    const env = browser(t); env.win.location = { hostname };
+    const instance = createInstance({ namespace: "default", storage: "memory" }); t.after(() => stop(instance));
+    const bucket = instance.createBucket({ id: "local.example.com" });
+    await bucket.put("note", { text: "offline" });
+    assert.equal((await bucket.get("note")).text, "offline");
+    await assert.rejects(instance.resume(), code("INVALID_INPUT"));
+    await assert.rejects(instance.connect(), code("INVALID_INPUT"));
+    assert.throws(() => instance.remote.getBucket(), code("INVALID_INPUT"));
+    assert.equal(env.calls.length, 0); assert.equal(env.opened.length, 0);
+  });
+}
+
+test("explicit invalid appId never falls back, and strings mean appId", async t => {
+  browser(t);
+  for (const value of ["", "UPPER.example", "[::1]", " a.example", null, 12]) {
+    assert.throws(() => createInstance({ appId: value }), code("INVALID_INPUT"));
+  }
+  const instance = createInstance("notes.example.com"); t.after(() => stop(instance));
+  assert.equal(instance.namespace, "notes.example.com");
+});
+
+test("importKey saves only the supplied identity, rejects repeats and reuses it on authorization", async t => {
+  const env = browser(t);
+  const { createInstanceKey } = await import("../src/auth/keys.ts");
+  const key = await createInstanceKey();
+  const instance = env.instance();
+  assert.equal(await env.data.get("meta:actor"), null);
+  await instance.importKey(key);
+  const prefix = "auth:instance:app.example.com:";
+  assert.deepEqual((await env.data.keys("")).sort(), [prefix + "active-instance:current", prefix + "instance-key:" + key.instanceId].sort());
+  const saved = await env.data.get(prefix + "instance-key:" + key.instanceId);
+  assert.equal(saved.signingPrivateKey.extractable, false);
+  assert.equal(saved.wrappingPrivateKey.extractable, false);
+  await assert.rejects(instance.importKey(key), code("KEY_EXISTS"));
+  assert.equal(await instance.resume(), "disconnected");
+  assert.equal(env.opened.length, 0); assert.equal(env.calls.length, 0);
+  const connecting = instance.connect(); const { wire } = await env.approve(); await connecting;
+  assert.equal(wire.mf_instance_id, key.instanceId);
+  assert.deepEqual(wire.mf_instance_wrapping_jwk, key.wrappingPublicJwk);
+  await assert.rejects(instance.importKey(key), code("INVALID_STATE"));
+});
+
+test("importKey is scoped to appId and rejects an orphan instance-key record", async t => {
+  const env = browser(t);
+  const { createInstanceKey } = await import("../src/auth/keys.ts");
+  await env.auth.set("instance:other.example:instance-key:existing", {});
+  await env.instance().importKey(await createInstanceKey());
+  const second = createInstance({ appId: "second.example", namespace: env.namespace }); t.after(() => stop(second));
+  await env.auth.set("instance:second.example:instance-key:orphan", {});
+  await assert.rejects(second.importKey(await createInstanceKey()), code("KEY_EXISTS"));
+  assert.deepEqual(await env.auth.get("instance:other.example:instance-key:existing"), {});
+});
+
+test("concurrent imports on separate Instances cannot both claim the same identity scope", async t => {
+  const env = browser(t);
+  const { createInstanceKey } = await import("../src/auth/keys.ts");
+  const key = await createInstanceKey(), a = env.instance(), b = env.instance();
+  const results = await Promise.allSettled([a.importKey(key), b.importKey(key)]);
+  assert.equal(results.filter(row => row.status === "fulfilled").length, 1);
+  assert.equal(results.find(row => row.status === "rejected").reason.code, "KEY_EXISTS");
+  assert.equal((await env.auth.keys("instance:app.example.com:instance-key:")).length, 1);
+});
+
+for (const importFirst of [false, true])
+test(`importKey rejects when connect ${importFirst ? "starts during validation" : "is already in progress"}`, async t => {
+  const env = browser(t);
+  const { createInstanceKey } = await import("../src/auth/keys.ts");
+  const key = await createInstanceKey(), instance = env.instance();
+  const importing = importFirst ? instance.importKey(key) : null;
+  const connecting = instance.connect();
+  await assert.rejects(importing ?? instance.importKey(key), code("INVALID_STATE"));
+  const { wire } = await env.approve();
+  await connecting;
+  assert.notEqual(wire.mf_instance_id, key.instanceId);
+  const rows = await env.auth.keys("instance:app.example.com:instance-key:");
+  assert.equal(rows.length, 1); assert.ok(rows[0].endsWith(wire.mf_instance_id));
+});
+
+for (const corruption of ["invalid-pointer", "missing-key", "invalid-key", "orphan-key"])
+test(`resume preserves ${corruption} records without creating a replacement identity`, async t => {
+  const env = browser(t);
+  const { createInstanceKey } = await import("../src/auth/keys.ts");
+  const key = await createInstanceKey(), instance = env.instance();
+  const prefix = "instance:app.example.com:";
+  if (corruption !== "missing-key") {
+    await env.auth.set(prefix + "instance-key:" + key.instanceId,
+      corruption === "invalid-key" ? {} : { ...key, updatedAt: key.createdAt });
+  }
+  if (corruption !== "orphan-key") {
+    await env.auth.set(prefix + "active-instance:current", {
+      v: corruption === "invalid-pointer" ? 2 : 1, instanceId: key.instanceId,
+    });
+  }
+  const before = await Promise.all((await env.auth.keys(prefix)).sort().map(async id => [id, await env.auth.get(id)]));
+  const failures = [];
+  instance.on("state", (state, error) => { if (error) failures.push([state, error.code]); });
+  await assert.rejects(instance.getKey(), code("INVALID_INSTANCE_KEY"));
+  assert.equal(await instance.resume(), "disconnected");
+  assert.deepEqual(failures, [["disconnected", "INVALID_INSTANCE_KEY"]]);
+  assert.equal(env.calls.length, 0); assert.equal(env.opened.length, 0);
+  await assert.rejects(instance.connect(), code("INVALID_INSTANCE_KEY"));
+  await assert.rejects(instance.createKey(), code("KEY_EXISTS"));
+  await assert.rejects(instance.importKey(key), code("KEY_EXISTS"));
+  const after = await Promise.all((await env.auth.keys(prefix)).sort().map(async id => [id, await env.auth.get(id)]));
+  assert.deepEqual(after, before);
+  assert.equal(instance.state, "disconnected");
+  assert.equal(env.calls.length, 0);
+  assert.ok(env.opened.every(popup => popup.closed && !popup.location.href.includes("authRequest")));
+  const local = instance.createBucket({ id: "offline.example.com" });
+  await local.put("note", { text: "retained" });
+  await instance.removeKey();
+  assert.equal(await instance.getKey(), null);
+  assert.equal((await local.get("note")).text, "retained");
+  await instance.importKey(key);
+  assert.equal((await instance.getKey()).instanceId, key.instanceId);
+});
+
+test("legacy Bucket connect and resume use explicit appId and the selected bucket resource", async t => {
+  const env = browser(t);
+  const options = { appId: "notes.example.com", namespace: env.namespace };
+  const instance = createInstance(options); t.after(() => stop(instance));
+  const bucket = instance.createBucket({ id: "archive.example.com" });
+  const connecting = bucket.connect({ autoSync: false });
+  const { wire } = await env.approve();
+  assert.equal(await connecting, "connected");
+  assert.equal(wire.client_id, options.appId);
+  assert.equal(wire.resource_id, "urn:myfield:bucket:archive.example.com");
+  const rows = await env.auth.keys("instance:notes.example.com:instance-key:");
+  assert.deepEqual(rows, ["instance:notes.example.com:instance-key:" + wire.mf_instance_id]);
+  assert.equal((await env.auth.keys("instance:app.example.com:")).length, 0);
+  stop(instance);
+  const restored = createInstance(options); t.after(() => stop(restored));
+  const reopened = restored.createBucket({ id: bucket.id });
+  assert.equal(await reopened.resume(), "connected");
+  assert.equal(env.opened.length, 1);
+  assert.deepEqual(await env.auth.keys("instance:notes.example.com:instance-key:"), rows);
+});
+
+test("getKey and createKey preserve nonextractable identity across reload without network", async t => {
+  const env = browser(t), instance = env.instance();
+  assert.equal(await instance.getKey(), null);
+  const key = await instance.createKey();
+  assert.equal(key.signingPrivateKey.extractable, false);
+  assert.equal(key.wrappingPrivateKey.extractable, false);
+  assert.equal("v" in key, false); assert.equal("updatedAt" in key, false);
+  await assert.rejects(crypto.subtle.exportKey("jwk", key.signingPrivateKey), { name: "InvalidAccessException" });
+  await assert.rejects(instance.createKey(), code("KEY_EXISTS"));
+  const snapshot = await instance.getKey();
+  snapshot.signingPublicJwk.x = "changed";
+  stop(instance);
+  const restored = env.instance(), saved = await restored.getKey();
+  assert.equal(saved.instanceId, key.instanceId);
+  assert.deepEqual(saved.signingPublicJwk, key.signingPublicJwk);
+  assert.equal(saved.signingPrivateKey.extractable, false);
+  assert.equal(env.calls.length, 0); assert.equal(env.opened.length, 0);
+  assert.equal(await env.data.get("meta:actor"), null);
+  const connecting = restored.connect(); const { wire } = await env.approve(); await connecting;
+  assert.equal(wire.mf_instance_id, key.instanceId);
+  assert.equal((await restored.getKey()).instanceId, key.instanceId);
+});
+
+test("removeKey clears only this appId's identity and dependent access, retaining Local data and endpoints", async t => {
+  const env = browser(t), instance = env.instance();
+  const key = await instance.createKey();
+  const local = instance.createBucket({ id: "local.example.com" });
+  await local.put("note", { text: "keep" });
+  const prefix = "instance:app.example.com:";
+  for (const suffix of ["context:old", "session:old", "pending-auth:old", "callback-pointer:old"]) {
+    await env.auth.set(prefix + suffix, { v: 1 });
+  }
+  await env.auth.set("instance:other.example:instance-key:original", { keep: true });
+  await env.data.set("meta:app.example.com:endpoints", { authBase: "https://myfield.one/auth/", apiBase: "https://api.example.test" });
+  await instance.removeKey(); await instance.removeKey();
+  assert.deepEqual(await env.auth.keys(prefix), []);
+  assert.equal(await instance.getKey(), null);
+  assert.equal((await local.get("note")).text, "keep");
+  assert.deepEqual(await env.auth.get("instance:other.example:instance-key:original"), { keep: true });
+  assert.equal((await env.data.get("meta:app.example.com:endpoints")).apiBase, "https://api.example.test");
+  assert.equal(await instance.resume(), "disconnected");
+  await instance.importKey(key);
+  assert.equal((await instance.getKey()).instanceId, key.instanceId);
+  assert.equal(env.calls.length, 0); assert.equal(env.opened.length, 0);
+});
+
+test("key mutations reject during connection and while connected, then allow explicit replacement after disconnect", async t => {
+  const env = browser(t), instance = env.instance();
+  const key = await instance.createKey();
+  const connecting = instance.connect();
+  for (const mutate of [() => instance.createKey(), () => instance.importKey(key), () => instance.removeKey()]) {
+    await assert.rejects(mutate(), code("INVALID_STATE"));
+  }
+  await env.approve(); await connecting;
+  for (const mutate of [() => instance.createKey(), () => instance.importKey(key), () => instance.removeKey()]) {
+    await assert.rejects(mutate(), code("INVALID_STATE"));
+  }
+  await instance.disconnect();
+  await instance.removeKey();
+  const next = await instance.createKey();
+  assert.notEqual(next.instanceId, key.instanceId);
+  assert.equal((await instance.getKey()).instanceId, next.instanceId);
+});
+
+test("key mutations cannot replace a legacy Bucket's connected identity", async t => {
+  const env = browser(t), instance = env.instance();
+  const key = await instance.createKey(), local = instance.createBucket({ id: "local.example.com" });
+  const connecting = local.connect({ autoSync: false }); await env.approve(); await connecting;
+  assert.equal((await instance.getKey()).instanceId, key.instanceId);
+  for (const mutate of [() => instance.createKey(), () => instance.importKey(key), () => instance.removeKey()]) {
+    await assert.rejects(mutate(), code("INVALID_STATE"));
+  }
+  await local.disconnect(); await instance.removeKey();
+  assert.equal(await instance.getKey(), null);
+});
+
+test("connect waits for an in-progress key removal before choosing an identity", async t => {
+  const env = browser(t);
+  const { createInstanceConnection } = await import("../src/remote/connection.ts");
+  const entered = deferred(), release = deferred();
+  const connection = createInstanceConnection({ getAppId: () => env.namespace, data: env.data,
+    hasLegacyBucket: () => false, auth: { ...env.auth, removePrefix: async prefix => {
+      entered.resolve(); await release.promise;
+      for (const key of await env.auth.keys(prefix)) await env.auth.remove(key);
+    } } });
+  t.after(() => { release.resolve(); connection.dispose(); });
+  const old = await connection.createKey();
+  const removing = connection.removeKey(); await entered.promise;
+  const connecting = connection.connect();
+  await tick(); assert.equal(env.calls.length, 0); assert.equal(env.opened.length, 0);
+  release.resolve(); await removing;
+  const { wire } = await env.approve(); await connecting;
+  assert.notEqual(wire.mf_instance_id, old.instanceId);
+  assert.equal((await connection.getKey()).instanceId, wire.mf_instance_id);
 });

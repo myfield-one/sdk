@@ -18,6 +18,7 @@ export type BucketBinaryValue = {
 
 export type CreateInstanceOptions = {
   namespace?: string;
+  appId?: string;
   storage?: "indexeddb" | "memory";
 };
 
@@ -58,6 +59,10 @@ export type Instance = {
   readonly namespace: string;
   readonly remote: { getBucket(): RemoteBucket };
   readonly state: BucketState;
+  getKey(): Promise<InstanceKey | null>;
+  createKey(): Promise<InstanceKey>;
+  importKey(key: InstanceKey): Promise<void>;
+  removeKey(): Promise<void>;
   resume(): Promise<BucketState>;
   connect(): Promise<BucketState>;
   disconnect(): Promise<void>;
@@ -65,7 +70,7 @@ export type Instance = {
   createBucket(options: { id: string }): Bucket;
 };
 
-export declare function createInstance(namespace: string): Instance;
+export declare function createInstance(appId: string): Instance;
 export declare function createInstance(options?: CreateInstanceOptions): Instance;
 
 export declare class NotConnectedError extends Error {
@@ -133,3 +138,12 @@ export declare class ClientError extends Error {
   readonly maxBytes?: number;
   constructor(code: string, message: string, options?: ClientErrorOptions);
 }
+
+export type InstanceKey = {
+  instanceId: string;
+  signingPublicJwk: JsonWebKey;
+  signingPrivateKey: CryptoKey;
+  wrappingPublicJwk: JsonWebKey;
+  wrappingPrivateKey: CryptoKey;
+  createdAt: string;
+};
