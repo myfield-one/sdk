@@ -13,26 +13,21 @@ import {
   b64urlToBytes,
   bytesToB64url,
   bytesToHex,
-  normalizeIsoDateTime,
   randomId,
-  sha256Hex,
   stableStringify,
   utf8Encode,
 } from "../internal/encoding.ts";
 import { unwrapBucketKeys, type BucketKeyGrantEnvelope, type BucketKeys } from "../bucket/keys.ts";
 import { createIndexedDbStorageAdapter, type StorageAdapter } from "../bucket/store.ts";
+import { createInstanceKey, type AuthInstance } from "./keys.ts";
+import { createSessionClient } from "../remote/session.ts";
+import { createSession, type CloudSessionCredential } from "./session.ts";
+
+export type { AuthInstance } from "./keys.ts";
+export type { CloudSessionCredential } from "./session.ts";
+export { signInstanceChallenge } from "./proof.ts";
 
 export type AuthCapability = "read" | "write";
-
-export type AuthInstance = {
-  v: 1;
-  instanceId: string;
-  signingPublicJwk: JsonWebKey;
-  signingPrivateKey: CryptoKey;
-  wrappingPublicJwk: JsonWebKey;
-  wrappingPrivateKey: CryptoKey;
-  createdAt: string;
-};
 
 export type InstanceAuthContext = {
   v: 1;
@@ -45,10 +40,6 @@ export type InstanceAuthContext = {
   authorizedAt: string;
   bucketAccessGrant?: BucketAccessGrant;
 };
-
-export type CloudSessionCredential =
-  | { carrier: "bearer"; token: string; expiresAt: string }
-  | { carrier: "cookie"; expiresAt: string };
 
 export type BucketAccess = {
   mfid: string;
@@ -162,14 +153,6 @@ type StoredCloudSessionCredential = {
   storedAt?: string;
 };
 
-type InstanceProof = {
-  type: "instance.es256";
-  instanceId: string;
-  alg: "ES256";
-  signedAt: string;
-  signature: string;
-};
-
 const AUTH_REQUEST_TTL_MS = 10 * 60 * 1000;
 const AUTH_CALLBACK_FRAGMENT_PARAM = "mf_auth_result";
 const DEFAULT_AUTH_IDB_NAME = "mf-sdk-auth-v1";
@@ -187,6 +170,7 @@ export function createInstanceAuthClient(options: InstanceAuthClientOptions = {}
   const inFlightSessionRefreshes = new Map<string, Promise<CloudSessionCredential>>();
   const storage = options.storage || createIndexedDbStorageAdapter({ dbName: DEFAULT_AUTH_IDB_NAME, storeName: "instance" });
   const fetchImpl = options.fetchImpl || fetch;
+  const sessions = createSessionClient((path, body) => postJson(fetchImpl, options.apiBase, path, body));
   const bucketAccessCache = new Map<string, { access: BucketAccess; expiresAt: number }>();
 
   const activeInstanceKey = () => `instance:${seg(appId)}:active-instance:current`;
@@ -244,7 +228,7 @@ export function createInstanceAuthClient(options: InstanceAuthClientOptions = {}
       instance = active;
       return active;
     }
-    return writeStoredInstance(await generateAuthInstance());
+    return writeStoredInstance(await createInstanceKey());
   }
 
   async function readContext(resourceId: string): Promise<InstanceAuthContext | null> {
@@ -278,38 +262,19 @@ export function createInstanceAuthClient(options: InstanceAuthClientOptions = {}
     const refreshSessionKey = `${sessionResourceId}:${authInstance.instanceId}`;
 
     const performRefreshSession = async (): Promise<CloudSessionCredential> => {
-      const challenge = await postJson<{ challengeId: string; challenge: string }>(fetchImpl, options.apiBase, "/v1/api/auth/instance-challenge", {
-        mfid,
-        resourceId: sessionResourceId,
-        instanceId: authInstance.instanceId,
-      });
-      const proof = await signInstanceChallenge({
-        instance: authInstance,
-        challengeId: challenge.challengeId,
-        challenge: challenge.challenge,
-        mfid,
-        resourceId: sessionResourceId,
-      });
-      const session = await postJson<{ credential: CloudSessionCredential }>(fetchImpl, options.apiBase, "/v1/api/auth/instance-session", {
-        mfid,
-        resourceId: sessionResourceId,
-        instanceId: authInstance.instanceId,
-        challengeId: challenge.challengeId,
-        proof,
-        credentialCarrier: "bearer",
-      });
-      currentSession = { resourceId: sessionResourceId, credential: session.credential };
-      if (session.credential.carrier === "bearer") {
+      const credential = await createSession({ instance: authInstance, mfid, resourceId: sessionResourceId }, sessions);
+      currentSession = { resourceId: sessionResourceId, credential };
+      if (credential.carrier === "bearer") {
         await storage.set(sessionKey(sessionResourceId, context.instanceId), {
           v: 1,
           mfid,
           resourceId: sessionResourceId,
           instanceId: authInstance.instanceId,
-          credential: session.credential,
+          credential,
           storedAt: new Date().toISOString(),
         } satisfies StoredCloudSessionCredential);
       }
-      return session.credential;
+      return credential;
     };
 
     const refreshSession = (): Promise<CloudSessionCredential> => {
@@ -512,50 +477,6 @@ export function createInstanceAuthClient(options: InstanceAuthClientOptions = {}
       }
     },
   };
-}
-
-async function generateAuthInstance(): Promise<AuthInstance> {
-  const signing = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign", "verify"]);
-  const wrapping = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
-  const signingPublicJwk = (await crypto.subtle.exportKey("jwk", signing.publicKey)) as JsonWebKey;
-  const wrappingPublicJwk = (await crypto.subtle.exportKey("jwk", wrapping.publicKey)) as JsonWebKey;
-  return {
-    v: 1,
-    instanceId: await deriveInstanceId(signingPublicJwk),
-    signingPublicJwk,
-    signingPrivateKey: signing.privateKey,
-    wrappingPublicJwk,
-    wrappingPrivateKey: wrapping.privateKey,
-    createdAt: new Date().toISOString(),
-  };
-}
-
-async function deriveInstanceId(signingPublicJwk: JsonWebKey): Promise<string> {
-  const digest = await sha256Hex(stableStringify(jwkCore(signingPublicJwk)));
-  return `inst_${digest.slice(0, 32)}`;
-}
-
-export async function signInstanceChallenge(input: {
-  instance: Pick<AuthInstance, "instanceId" | "signingPrivateKey">;
-  challenge: string;
-  mfid: string;
-  resourceId: string;
-  challengeId?: string;
-  signedAt?: string;
-}): Promise<InstanceProof> {
-  const signedAt = normalizeIsoDateTime(input.signedAt) || new Date().toISOString();
-  const payload = stableStringify({
-    v: 1,
-    type: "instance-proof",
-    instanceId: input.instance.instanceId,
-    challenge: input.challenge,
-    challengeId: input.challengeId || "",
-    mfid: input.mfid,
-    resourceId: input.resourceId,
-    signedAt,
-  });
-  const signature = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, input.instance.signingPrivateKey, utf8Encode(payload));
-  return { type: "instance.es256", instanceId: input.instance.instanceId, alg: "ES256", signedAt, signature: bytesToB64url(new Uint8Array(signature)) };
 }
 
 type AuthRequestFields = {
@@ -854,15 +775,6 @@ function normalizeInstanceAppId(value: unknown): string {
 
 function seg(value: string): string {
   return encodeURIComponent(value);
-}
-
-function jwkCore(jwk: JsonWebKey): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const key of ["kty", "crv", "x", "y", "kid", "alg", "use"] as const) {
-    const value = (jwk as Record<string, unknown>)[key];
-    if (typeof value === "string") out[key] = value;
-  }
-  return out;
 }
 
 function browserLocationHref(): string {
