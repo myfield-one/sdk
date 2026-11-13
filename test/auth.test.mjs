@@ -145,3 +145,82 @@ test("instance challenge proof verifies against the signing key", async () => {
   );
   assert.ok(valid, "proof signature verifies");
 });
+
+test("reopening IndexedDB reuses nonextractable instance keys and the existing record layout", async () => {
+  await import("fake-indexeddb/auto");
+  const { createIndexedDbStorageAdapter } = await import("../src/bucket/store.ts");
+  const dbName = `auth-reopen-${crypto.randomUUID()}`;
+  const firstStore = createIndexedDbStorageAdapter({ dbName });
+  const first = await makeAuthClient({ storage: firstStore }).client.ensureInstance();
+  const before = (await firstStore.keys("")).sort();
+  const secondStore = createIndexedDbStorageAdapter({ dbName });
+  const second = await makeAuthClient({ storage: secondStore }).client.ensureInstance();
+  assert.equal(second.instanceId, first.instanceId);
+  assert.deepEqual(second.signingPublicJwk, first.signingPublicJwk);
+  assert.deepEqual(second.wrappingPublicJwk, first.wrappingPublicJwk);
+  assert.deepEqual((await secondStore.keys("")).sort(), before);
+  for (const key of [second.signingPrivateKey, second.wrappingPrivateKey]) {
+    assert.equal(key.extractable, false);
+    await assert.rejects(crypto.subtle.exportKey("jwk", key));
+  }
+  const proof = await signInstanceChallenge({ instance: second, challenge: "reopened", mfid: ALIAS_MFID, resourceId: RESOURCE_ID });
+  const publicKey = await crypto.subtle.importKey("jwk", first.signingPublicJwk, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+  const payload = Object.fromEntries(Object.entries({ v: 1, type: "instance-proof", instanceId: first.instanceId,
+    challenge: "reopened", challengeId: "", mfid: ALIAS_MFID, resourceId: RESOURCE_ID, signedAt: proof.signedAt }).sort());
+  assert.equal(await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, publicKey,
+    Buffer.from(proof.signature, "base64url"), utf8(JSON.stringify(payload))), true);
+});
+
+for (const failedRoute of ["instance-challenge", "instance-session"]) {
+  test(`session ${failedRoute} failure preserves authorization and permits a later retry`, async () => {
+    let fail = true;
+    const calls = [];
+    const storage = createReferenceStorage();
+    const fetchImpl = async (url, init) => {
+      calls.push({ url: String(url), body: JSON.parse(init.body) });
+      if (fail && String(url).endsWith(failedRoute)) return new Response("unavailable", { status: 503 });
+      if (String(url).endsWith("instance-challenge")) return Response.json({ challengeId: "ch_retry", challenge: "retry" });
+      return Response.json({ credential: { carrier: "bearer", token: "retry-token", expiresAt: new Date(Date.now() + 7200_000).toISOString() } });
+    };
+    const { client, authUrl } = makeAuthClient({ storage, fetchImpl });
+    await client.authorize({ bucketId: BUCKET_ID });
+    await client.handleCallback((await buildApprovedCallback(decodeAuthRequestFragment(authUrl()), "https://app.example.com/")).callbackUrl);
+    const before = await client.getContext(BUCKET_ID);
+    const identity = await client.ensureInstance();
+    await assert.rejects(client.getSession(BUCKET_ID), /503/);
+    assert.deepEqual(await client.getContext(BUCKET_ID), before);
+    assert.equal(calls.length, failedRoute === "instance-challenge" ? 1 : 2, "no automatic retry");
+    fail = false;
+    const [first, second] = await Promise.all([client.getSession(BUCKET_ID), client.getSession(BUCKET_ID)]);
+    assert.equal(first.token, "retry-token");
+    assert.deepEqual(first, second);
+    assert.equal(calls.length, (failedRoute === "instance-challenge" ? 1 : 2) + 2, "concurrent refresh is shared");
+    assert.ok(calls.every(call => call.body.instanceId === identity.instanceId));
+    await client.getSession(BUCKET_ID, { forceRefresh: true });
+    assert.equal(calls.length, (failedRoute === "instance-challenge" ? 1 : 2) + 4);
+    const reopened = makeAuthClient({ storage, fetchImpl }).client;
+    assert.equal((await reopened.getSession(BUCKET_ID)).token, "retry-token");
+    assert.equal(calls.length, (failedRoute === "instance-challenge" ? 1 : 2) + 4, "saved bearer is reused after reopening");
+  });
+}
+
+test("restoring an existing identity preserves its saved ID even with annotated public JWK", async () => {
+  const { deriveInstanceId } = await import("../src/auth/keys.ts");
+  const { sha256Hex, stableStringify } = await import("../src/internal/encoding.ts");
+  const storage = createReferenceStorage();
+  const original = await makeAuthClient({ storage }).client.ensureInstance();
+  const prefix = `instance:${encodeURIComponent(BUCKET_ID)}:`;
+  const signingPublicJwk = { ...original.signingPublicJwk, kid: "existing-key", alg: "ES256", use: "sig" };
+  const legacyId = "inst_" + (await sha256Hex(stableStringify({ kty: signingPublicJwk.kty,
+    crv: signingPublicJwk.crv, x: signingPublicJwk.x, y: signingPublicJwk.y,
+    kid: signingPublicJwk.kid, alg: signingPublicJwk.alg, use: signingPublicJwk.use }))).slice(0, 32);
+  assert.notEqual(legacyId, await deriveInstanceId(signingPublicJwk));
+  const saved = { ...original, signingPublicJwk, instanceId: legacyId, updatedAt: original.createdAt };
+  await storage.remove(`${prefix}instance-key:${original.instanceId}`);
+  await storage.set(`${prefix}instance-key:${legacyId}`, saved);
+  await storage.set(`${prefix}active-instance:current`, { v: 1, instanceId: legacyId, updatedAt: original.createdAt });
+  const before = (await storage.keys("")).sort();
+  const restored = await makeAuthClient({ storage }).client.ensureInstance();
+  assert.deepEqual(restored, saved);
+  assert.deepEqual((await storage.keys("")).sort(), before);
+});
