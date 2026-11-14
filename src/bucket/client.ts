@@ -49,6 +49,7 @@ export type BucketClientOptions = {
   mergeStrategyFor?: (appObjectId: string) => MergeStrategy;
   maxCasAttempts?: number;
   pushDebounceMs?: number;
+  autoSync?: boolean;
   localOnlyObjectIds?: Iterable<string>;
   validateRemote?: (appObjectId: string, doc: PayloadDoc) => void;
   onChange?: (appObjectId: string, source: ChangeSource) => void;
@@ -90,6 +91,7 @@ export class BucketClient {
   private readonly unresolved = new Map<string, string>();
   private triggerCleanup: (() => void) | null = null;
   private disposed = false;
+  private autoSync: boolean;
 
   constructor(options: BucketClientOptions) {
     this.transport = options.transport;
@@ -104,6 +106,7 @@ export class BucketClient {
     this.validateRemote = options.validateRemote;
     this.onChange = options.onChange;
     this.onSyncError = options.onSyncError;
+    this.autoSync = options.autoSync ?? true;
   }
 
   // ---- local reads -------------------------------------------------------
@@ -260,6 +263,7 @@ export class BucketClient {
   // are scheduled by setFields/setData.
   start(options: { intervalMs?: number; run: () => Promise<void> }): void {
     if (this.triggerCleanup || this.disposed) return;
+    this.autoSync = true;
     const run = options.run;
     const kick = () => void run().catch((error) => this.onSyncError?.(null, error));
     const intervalMs = options.intervalMs ?? DEFAULT_SYNC_INTERVAL_MS;
@@ -271,6 +275,7 @@ export class BucketClient {
   }
 
   stop(): void {
+    this.autoSync = false;
     this.triggerCleanup?.();
     this.triggerCleanup = null;
     for (const timer of this.pendingPushTimers.values()) clearTimeout(timer);
@@ -297,7 +302,7 @@ export class BucketClient {
   // ---- internals ---------------------------------------------------------
 
   private schedulePush(appObjectId: string): void {
-    if (this.disposed || this.localOnly.has(appObjectId)) return;
+    if (this.disposed || !this.autoSync || this.localOnly.has(appObjectId)) return;
     const existing = this.pendingPushTimers.get(appObjectId);
     if (existing) clearTimeout(existing);
     this.pendingPushTimers.set(

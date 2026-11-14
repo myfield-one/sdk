@@ -9,14 +9,14 @@ encrypted sync.
 ```ts
 import { createInstance } from "@myfield/sdk";
 
-const instance = createInstance();
-const bucket = instance.createBucket({ id: "app.example.com" });
+const instance = createInstance("notes.example.com");
+const bucket = instance.getBucket();
 
 await bucket.put("note:1", { title: "hello", body: "world" });
 const note = await bucket.get("note:1");
 const notes = await bucket.list({ prefix: "note:" });
 
-await bucket.connect();
+await instance.connect();
 ```
 
 ## `createInstance`
@@ -33,13 +33,15 @@ createInstance(options?: {
 `appId` defaults to the browser hostname. Use lowercase ASCII domain-form names,
 1–63 characters.
 
-## `instance.createBucket(options)`
+## Buckets
 
 ```ts
+instance.getBucket(): Bucket;
 instance.createBucket(options: { id: string }): Bucket;
 ```
 
-- `id` is required. Use a stable domain-shaped id, usually the app host, for
+- `getBucket()` returns the cached default bucket, whose id is appId.
+- `createBucket()` remains available for other buckets. Use a stable domain-shaped id, usually the app host, for
   example `"app.example.com"`.
 - Creating a bucket is local-only: no network and no account.
 - The local bucket id is the user-facing resource label. Myfield may bind it to
@@ -157,32 +159,36 @@ nonextractable private CryptoKeys and createdAt.
 ## Connection API
 
 ```ts
-bucket.resume(): Promise<void>;
-
-bucket.connect(options?: {
-  authBase?: string;  // default "https://myfield.one/auth/"
-  autoSync?: boolean; // default true
-}): Promise<void>;
+instance.resume(options?: { autoSync?: boolean }): Promise<BucketState>;
+instance.connect(options?: { autoSync?: boolean }): Promise<BucketState>;
+instance.disconnect(): Promise<void>;
 
 bucket.sync(): Promise<void>;
 bucket.setAutoSync(enabled: boolean): void;
-bucket.disconnect(): Promise<void>;
 
-bucket.state; // "disconnected" | "connecting" | "connected"
+instance.state; // "disconnected" | "connecting" | "connected"
 
-const offState = bucket.on("state", (state, detail?) => {});
+const offState = instance.on("state", (state, error?) => {});
 const offChange = bucket.on("change", (objectId) => {});
 ```
 
 - Call `resume()` on app boot. It completes pending auth callbacks and restores
   existing authorization without prompting.
-- Call `connect()` from a user gesture. It may open the Myfield auth page.
-- `authBase` defaults to `https://myfield.one/auth/`. API endpoints are not
-  public SDK options.
-- With `autoSync`, the SDK syncs after connecting and after local writes.
+- Call `connect()` from a user gesture. It validates the server session when establishing
+  a connection, opening authorization when needed. Already-connected calls reuse access.
+- Automatic sync defaults to true. Set `autoSync: false` to stop automatic triggers;
+  Local CRUD, manual `bucket.sync()` and Remote requests remain available.
 - Browser lifecycle sync is app-owned. Apps may call `bucket.sync()` on focus,
   visibility, or online events.
-- `disconnect()` drops the remote binding and authorization. Local data stays.
+- `disconnect()` drops this resource's connection and authorization, retaining Local data.
+
+Legacy bucket resume/connect/disconnect remain supported; bucket.connect also accepts
+`authBase` and `autoSync`. The same resource shares its connection with Instance/Remote.
+`authBase` is the exact absolute authorization page URL; no `/auth/` path is appended
+and no API host is inferred. The API address comes from the authorization grant; access
+without a usable one is treated as unauthorized and needs reauthorization. Invalid
+calls reject; authorization-flow failures resolve `"disconnected"` and report the error
+through the state event.
 
 ## Events
 
@@ -234,7 +240,7 @@ import { createInstance } from "@myfield/sdk";
 
 const instance = createInstance("notes.example.com");
 const remote = instance.remote.getBucket();
-await instance.resume(); // Startup; never prompts.
+await instance.resume({ autoSync: false }); // Startup; never prompts.
 
 if (instance.state === "connected") {
   const head = await remote.getCurrent("note:1");
@@ -243,10 +249,10 @@ if (instance.state === "connected") {
     console.log(meta.versionId, await payload.arrayBuffer());
   }
 }
-// Call instance.connect() from your Connect button.
+// Call instance.connect({ autoSync: false }) from your Connect button.
 ```
 
-`getBucket()` returns the default bucket's Remote handle. Resume or connect before using
+`instance.remote.getBucket()` returns the default bucket's Remote handle. Resume or connect before using
 it. Missing current objects return null; missing versions throw. `getVersion()`
 returns metadata and a payload Response; consume or cancel its body.
 
@@ -255,7 +261,6 @@ to authorize or recover from `NOT_AUTHORIZED`; network failures never open autho
 Both return the connection state; `on("state")` reports changes and errors.
 `disconnect()` clears shared bucket access and pending requests across tabs,
 retaining keys, objects and endpoints.
-Remote operations do not start Local sync.
 
 `commit()` submits app-encoded metadata and encrypted bytes against
 `expectedHeadVersionId`; null requests creation. The app owns encryption and merge.

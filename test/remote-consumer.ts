@@ -67,6 +67,10 @@ const stream = await remote.watchFeed({ signal });
 for await (const hint of stream) { console.log(hint.objectId, hint.versionId); }
 void feed; void history;
 const bucket = createInstance({ namespace: "existing", storage: "memory" }).createBucket({ id: "app.example.com" });
+const unified = createInstance("unified.example.com");
+await unified.resume({ autoSync: false });
+await unified.connect({ autoSync: true });
+await unified.getBucket().sync();
 await bucket.ready(); await bucket.put("note", { text: "existing" });
 bucket.on("state", state => console.log(state));
 

@@ -1,7 +1,7 @@
 import type { StorageAdapter } from "../bucket/store.ts";
 import { ClientError } from "../errors.ts";
 import { createInstanceKey, type AuthInstance } from "./keys.ts";
-import { isValidInstanceId } from "./identifiers.ts";
+import { isPublicP256EcJwk, isValidInstanceId } from "./identifiers.ts";
 
 type StoredInstance = AuthInstance & { updatedAt: string };
 
@@ -27,6 +27,7 @@ export function createInstanceKeyStore(storage: StorageAdapter, appId: string) {
     const value = await storage.get<StoredInstance>(keys.key(id));
     if (!value) return null;
     if (value.v !== 1 || value.instanceId !== id || !isValidInstanceId(id)
+      || !isPublicP256EcJwk(value.signingPublicJwk) || !isPublicP256EcJwk(value.wrappingPublicJwk)
       || !(value.signingPrivateKey instanceof CryptoKey) || !(value.wrappingPrivateKey instanceof CryptoKey)) {
       throw new ClientError("INVALID_INSTANCE_KEY", "Stored instance key is invalid");
     }

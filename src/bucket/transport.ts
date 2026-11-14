@@ -7,12 +7,13 @@
 import { fnv1a32Bytes, utf8Encode } from "../internal/encoding.ts";
 import { decryptEnvelope, encryptEnvelopeFields } from "./crypto.ts";
 import type { BucketKeys } from "./keys.ts";
+import { REVOKED_AUTHORIZATION_CODES } from "../errors.ts";
 
 export type SessionCredential = { carrier: "bearer"; token: string } | { carrier: "cookie" };
 
 export type SessionProvider = {
   getSession(options?: { forceRefresh?: boolean }): Promise<SessionCredential>;
-  onUnauthorized?: () => void;
+  onUnauthorized?: () => void | Promise<void>;
 };
 
 export type TransportHeadResult = { found: false } | { found: true; versionId: string };
@@ -35,10 +36,10 @@ export class BucketTransportError extends Error {
   readonly status: number;
   readonly retryable: boolean;
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, retryable = status === 429 || status >= 500) {
     super(message);
     this.status = status;
-    this.retryable = status === 429 || status >= 500;
+    this.retryable = retryable;
   }
 }
 
@@ -47,6 +48,7 @@ export type BucketTransportOptions = {
   mfid: string;
   keys: BucketKeys;
   sessionProvider: SessionProvider;
+  fetch?: typeof fetch;
 };
 
 export class BucketTransport {
@@ -54,12 +56,14 @@ export class BucketTransport {
   private readonly mfid: string;
   private readonly keys: BucketKeys;
   private readonly sessionProvider: SessionProvider;
+  private readonly fetch: typeof fetch;
 
   constructor(options: BucketTransportOptions) {
     this.apiBase = options.apiBase.replace(/\/+$/, "");
     this.mfid = options.mfid;
     this.keys = options.keys;
     this.sessionProvider = options.sessionProvider;
+    this.fetch = options.fetch ?? ((...args) => globalThis.fetch(...args));
   }
 
   async pullHead(wireObjectId: string): Promise<TransportHeadResult> {
@@ -137,7 +141,17 @@ export class BucketTransport {
       return { ok: false, conflict: true, remoteVersionId: body?.headVersionId ?? null };
     }
     if (!res.ok) throw new BucketTransportError(`push failed: ${res.status}`, res.status);
-    return { ok: true, versionId };
+    const result = await readJsonObject(res, "push");
+    if (result.ok === true) return { ok: true, versionId };
+    if (result.ok === false && ["version-mismatch", "conflict"].includes(String(result.reason))) {
+      return { ok: false, conflict: true, remoteVersionId: typeof result.headVersionId === "string" ? result.headVersionId : null };
+    }
+    if (result.ok === false && result.reason === "unauthorized") {
+      await this.sessionProvider.onUnauthorized?.();
+      throw new BucketTransportError("push was not authorized", 401, false);
+    }
+    throw new BucketTransportError(`push returned an unconfirmed acknowledgement${typeof result.reason === "string" ? `: ${result.reason}` : ""}`,
+      res.status, result.reason !== "invalid-input");
   }
 
   async listHeads(): Promise<Map<string, string>> {
@@ -178,11 +192,19 @@ export class BucketTransport {
     let session = await this.sessionProvider.getSession();
     let res = await this.send(build(), session);
     if (res.status === 401) {
+      void res.body?.cancel().catch(() => {});
       session = await this.sessionProvider.getSession({ forceRefresh: true });
       res = await this.send(build(), session);
       if (res.status === 401) {
-        this.sessionProvider.onUnauthorized?.();
+        await this.sessionProvider.onUnauthorized?.();
         throw new BucketTransportError("bucket session unauthorized", 401);
+      }
+    }
+    if (res.status === 403) {
+      const body = await res.clone().json().catch(() => null) as { code?: string } | null;
+      if (REVOKED_AUTHORIZATION_CODES.includes(body?.code || "")) {
+        await this.sessionProvider.onUnauthorized?.();
+        throw new BucketTransportError("bucket authorization revoked", 403);
       }
     }
     return res;
@@ -192,7 +214,7 @@ export class BucketTransport {
     const headers = new Headers(req.init.headers);
     headers.set("x-myfield-mfid", this.mfid);
     if (session.carrier === "bearer") headers.set("Authorization", `Bearer ${session.token}`);
-    return fetch(req.url, {
+    return this.fetch(req.url, {
       ...req.init,
       headers,
       ...(session.carrier === "cookie" ? { credentials: "include" as RequestCredentials } : {}),

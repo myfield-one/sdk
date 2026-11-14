@@ -3,11 +3,11 @@ import test from "node:test";
 
 import { BucketTransport, BucketTransportError } from "../src/bucket/transport.ts";
 
-function createTransport() {
+function createTransport(payloadKey = null) {
   return new BucketTransport({
     apiBase: "https://api.example.test",
     mfid: "mf_test",
-    keys: { bucketId: "b1", keyId: "k1", payloadKey: null, wireObjectId: async (id) => id },
+    keys: { bucketId: "b1", keyId: "k1", payloadKey, wireObjectId: async (id) => id },
     sessionProvider: { getSession: async () => ({ carrier: "bearer", token: "t" }) },
   });
 }
@@ -80,3 +80,37 @@ test("listHeads surfaces an unavailable index as a retryable error", () =>
       await assert.rejects(createTransport().listHeads(), (error) => error instanceof BucketTransportError && error.retryable);
     }
   ));
+
+for (const reason of ["version-mismatch", "conflict"])
+test(`legacy upload parses HTTP 200 ${reason} as CAS rejection`, async () => {
+  const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt"]);
+  await withFetch(() => ({ ok: false, reason, headVersionId: "remote" }), async () => {
+    assert.deepEqual(await createTransport(key).push("ob_note", new Uint8Array([1]), "base"),
+      { ok: false, conflict: true, remoteVersionId: "remote" });
+  });
+});
+
+for (const result of [{}, { ok: "true" }, { ok: false }, { ok: false, reason: "unavailable" }])
+test(`legacy upload cannot confirm ${JSON.stringify(result)}`, async () => {
+  const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt"]);
+  await withFetch(() => result, async () => {
+    await assert.rejects(createTransport(key).push("ob_note", new Uint8Array([1]), null),
+      error => error instanceof BucketTransportError && error.retryable);
+  });
+});
+
+test("legacy upload unauthorized acknowledgement invalidates access without retry", async () => {
+  const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt"]);
+  let invalidated = 0;
+  const transport = new BucketTransport({
+    apiBase: "https://api.example.test",
+    mfid: "mf_test",
+    keys: { bucketId: "b1", keyId: "k1", payloadKey: key, wireObjectId: async (id) => id },
+    sessionProvider: { getSession: async () => ({ carrier: "bearer", token: "t" }), onUnauthorized: async () => { invalidated++; } },
+  });
+  await withFetch(() => ({ ok: false, reason: "unauthorized" }), async () => {
+    await assert.rejects(transport.push("ob_note", new Uint8Array([1]), null),
+      error => error instanceof BucketTransportError && !error.retryable && error.status === 401);
+  });
+  assert.equal(invalidated, 1);
+});

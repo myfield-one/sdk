@@ -91,10 +91,10 @@ const instance = createInstance("sdk-remote-verification.example");
 const status = document.getElementById("status"), result = document.getElementById("result");
 const connect = document.getElementById("connectButton"), verify = document.getElementById("verifyButton");
 instance.on("state", (state, error) => { status.textContent = state + (error ? ": " + error.code : ""); verify.disabled = state !== "connected"; });
-const restoring = instance.resume();
+const restoring = instance.resume({ autoSync: false });
 restoring.then(state => { status.textContent = state; verify.disabled = state !== "connected"; })
   .catch(error => { status.textContent = error.code || error.message; });
-connect.onclick = async () => { try { await instance.connect(); } catch (error) { status.textContent = error.code || error.message; } };
+connect.onclick = async () => { try { await instance.connect({ autoSync: false }); } catch (error) { status.textContent = error.code || error.message; } };
 async function run() {
   verify.disabled = connect.disabled = true;
   const controller = new AbortController();

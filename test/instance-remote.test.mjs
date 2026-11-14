@@ -36,10 +36,12 @@ function browser(t, { namespace = "app.example.com", popup = true } = {}) {
     history: { replaceState(_state, _title, url) { win.location = new URL(url); } },
     addEventListener(event, listener) { if (event === "message") listeners.add(listener); },
     removeEventListener(event, listener) { if (event === "message") listeners.delete(listener); },
-    open() {
+    open(_url, name) {
       if (!popup) return null;
+      const existing = opened.find(handle => handle.name === name && !handle.closed);
+      if (existing) return existing;
       const handle = { location: { href: "about:blank" }, closed: false,
-        close() { this.closed = true; }, focus() {}, document: { title: "", body: {} } };
+        name, close() { this.closed = true; }, focus() {}, document: { title: "", body: {} } };
       opened.push(handle); return handle;
     },
   };
@@ -50,6 +52,7 @@ function browser(t, { namespace = "app.example.com", popup = true } = {}) {
       carrier: "bearer", token: "token", expiresAt: new Date(Date.now() + 3 * 3600_000).toISOString(),
     } });
     if (call.url.pathname.endsWith("/current")) return Response.json({ versionId: null, headVersionMeta: null });
+    if (call.url.pathname.endsWith("/objects:index")) return Response.json({ bucketId: "remote.example.com", objects: [], feedCursor: null, hasMoreFeed: false });
     return Response.json({ ok: true });
   };
   let handler = defaultHandler;
@@ -74,7 +77,7 @@ function browser(t, { namespace = "app.example.com", popup = true } = {}) {
     win, data, auth, opened, calls, namespace,
     setHandler(next) { handler = next; },
     resetHandler() { handler = defaultHandler; },
-    instance() { const result = createInstance(namespace); instances.push(result); return result; },
+    instance({ autoSync = false } = {}) { const result = createInstance(namespace); result.getBucket().setAutoSync(autoSync); instances.push(result); return result; },
     legacy() { const result = createInstance({ namespace }); instances.push(result); return result; },
     send(callbackUrl, source = opened.at(-1), origin = "https://myfield.one") {
       for (const listener of listeners) listener({ source, origin, data: { type: "myfield.auth.callback", callbackUrl } });
@@ -96,6 +99,8 @@ test("initialization is inert, selects same-named bucket and validates namespace
   const realOpen = indexedDB.open.bind(indexedDB);
   indexedDB.open = (...args) => { opens++; return realOpen(...args); };
   const a = env.instance();
+  assert.equal(a.getBucket(), a.getBucket());
+  assert.equal(a.getBucket(), a.createBucket({ id: env.namespace }));
   const b = createInstance({ namespace: env.namespace });
   t.after(() => stop(b));
   assert.equal(a.remote.getBucket(), a.remote.getBucket());
@@ -185,20 +190,21 @@ test("saved access failures retain grants without prompting, and disconnect allo
   assert.equal((await env.data.get(`meta:${env.namespace}:endpoints`)).authBase, "https://myfield.one/auth/");
 });
 
-test("same-named legacy bucket blocks Instance APIs without changing legacy connection", async t => {
+test("same-named legacy Bucket and Instance share authorization", async t => {
   const env = browser(t), instance = env.instance();
   const remote = instance.remote.getBucket();
   const local = instance.createBucket({ id: env.namespace });
-  assert.throws(() => instance.remote.getBucket(), code("INVALID_STATE"));
-  await assert.rejects(remote.getCurrent("note"), code("INVALID_STATE"));
-  await assert.rejects(instance.connect(), code("INVALID_STATE"));
-  await assert.rejects(instance.resume(), code("INVALID_STATE"));
-  await assert.rejects(instance.disconnect(), code("INVALID_STATE"));
-  const connecting = local.connect({ autoSync: false });
-  await until(() => env.opened.at(-1)?.location.href.includes("authRequest"));
-  env.opened.at(-1).close();
-  assert.equal(await connecting, "disconnected");
+  assert.equal(local, instance.getBucket());
+  assert.equal(remote, instance.remote.getBucket());
+  const connecting = instance.connect();
+  const localConnecting = local.connect({ autoSync: false });
+  await env.approve();
+  assert.equal(await connecting, "connected");
+  assert.equal(await localConnecting, "connected");
+  assert.equal(env.opened.length, 1);
+  assert.equal(await remote.getCurrent("note"), null);
   await local.disconnect();
+  assert.equal(instance.state, "disconnected");
 });
 
 test("disconnect cancels popup and late callback, and immediate reconnect is independent", async t => {
@@ -337,7 +343,7 @@ test("disconnect waits for an already-started callback write and removes its res
     if (key.includes(":context:")) { entered.resolve(); await release.promise; }
     await env.auth.set(key, value);
   } };
-  const connection = createInstanceConnection({ getAppId: () => env.namespace, data: env.data, auth, hasLegacyBucket: () => false });
+  const connection = createInstanceConnection({ getAppId: () => env.namespace, data: env.data, auth });
   t.after(() => connection.dispose());
   const connecting = connection.connect(); const failed = assert.rejects(connecting);
   await env.approve(); await entered.promise;
@@ -509,18 +515,31 @@ test("saved-access network failures reject without reopening authorization", asy
   assert.equal((await env.auth.keys("instance:app.example.com:context:")).length, 1);
 });
 
-test("creating a same-named legacy bucket invalidates Instance connection, but legacy resume still works", async t => {
+test("creating a same-named legacy bucket retains the shared Instance connection", async t => {
   const env = browser(t), instance = env.instance();
   const connecting = instance.connect(); await env.approve(); await connecting;
   const remote = instance.remote.getBucket();
   const local = instance.createBucket({ id: env.namespace });
-  assert.equal(instance.state, "disconnected");
-  await assert.rejects(remote.getCurrent("note"), code("INVALID_STATE"));
-  await assert.rejects(instance.resume(), code("INVALID_STATE"));
+  assert.equal(local, instance.getBucket());
+  assert.equal(instance.state, "connected");
+  assert.equal(await remote.getCurrent("note"), null);
+  assert.equal(await instance.resume(), "connected");
   assert.equal(await local.resume(), "connected");
   assert.equal(env.opened.length, 1);
   local.dispose();
-  await assert.rejects(instance.connect(), code("INVALID_STATE"));
+  assert.equal(await instance.connect({ autoSync: false }), "connected");
+});
+
+test("disposing a Local handle does not block key changes after disconnect", async t => {
+  const env = browser(t), instance = env.instance();
+  const connecting = instance.connect({ autoSync: false }); await env.approve(); await connecting;
+  const key = await instance.getKey();
+  instance.getBucket().dispose();
+  await assert.rejects(instance.removeKey(), code("INVALID_STATE"));
+  await instance.disconnect();
+  await instance.removeKey();
+  await instance.importKey(key);
+  assert.equal((await instance.getKey()).instanceId, key.instanceId);
 });
 
 test("legacy-written authorization restores into a separate Instance", async t => {
@@ -578,15 +597,17 @@ test("disconnect clears pending requests for the shared bucket across flows", as
   assert.equal(await env.auth.get(pointer.pendingKey), null);
 });
 
-test("creating same-named legacy bucket cancels an active Instance popup without wrapping legacy methods", async t => {
+test("getting the default Local bucket leaves an active Instance authorization intact", async t => {
   const env = browser(t), instance = env.instance();
-  const connecting = instance.connect(); const cancelled = assert.rejects(connecting, code("INVALID_STATE"));
+  const connecting = instance.connect();
   await until(() => env.opened.at(-1)?.location.href.includes("authRequest"));
   const local = instance.createBucket({ id: env.namespace });
-  await cancelled; assert.equal(env.opened[0].closed, true);
+  assert.equal(local, instance.getBucket());
+  assert.equal(env.opened[0].closed, false);
   const legacyConnect = local.connect({ autoSync: false });
-  await until(() => env.opened.length === 2);
   await env.approve();
+  assert.equal(await connecting, "connected");
+  assert.equal(env.opened.length, 1);
   assert.equal(await legacyConnect, "connected"); local.dispose();
 });
 
@@ -829,7 +850,7 @@ test("no-argument initialization resumes existing hostname identity in the defau
   await original.handleCallback((await buildApprovedCallback(wire, env.win.location.href)).callbackUrl);
   await data.set("meta:app.example.com:endpoints", { authBase: "https://myfield.one/auth/", apiBase: "https://api.example.test" });
   const instance = createInstance(); t.after(() => stop(instance));
-  assert.equal(await instance.resume(), "connected");
+  assert.equal(await instance.resume({ autoSync: false }), "connected");
   assert.equal((await original.ensureInstance()).instanceId, wire.mf_instance_id);
   assert.equal((await data.keys("auth:instance:app.example.com:instance-key:")).length, 1);
   assert.equal(env.opened.length, 0);
@@ -916,15 +937,19 @@ test(`importKey rejects when connect ${importFirst ? "starts during validation" 
   assert.equal(rows.length, 1); assert.ok(rows[0].endsWith(wire.mf_instance_id));
 });
 
-for (const corruption of ["invalid-pointer", "missing-key", "invalid-key", "orphan-key"])
+for (const corruption of ["invalid-pointer", "missing-key", "invalid-key", "orphan-key",
+  "missing-signing-public-key", "invalid-signing-public-key", "missing-wrapping-public-key", "invalid-wrapping-public-key"])
 test(`resume preserves ${corruption} records without creating a replacement identity`, async t => {
   const env = browser(t);
   const { createInstanceKey } = await import("../src/auth/keys.ts");
   const key = await createInstanceKey(), instance = env.instance();
   const prefix = "instance:app.example.com:";
   if (corruption !== "missing-key") {
+    const record = { ...key, updatedAt: key.createdAt };
+    if (corruption.includes("signing-public-key")) record.signingPublicJwk = corruption.startsWith("missing") ? null : { ...key.signingPublicJwk, crv: "P-384" };
+    if (corruption.includes("wrapping-public-key")) record.wrappingPublicJwk = corruption.startsWith("missing") ? null : {};
     await env.auth.set(prefix + "instance-key:" + key.instanceId,
-      corruption === "invalid-key" ? {} : { ...key, updatedAt: key.createdAt });
+      corruption === "invalid-key" ? {} : record);
   }
   if (corruption !== "orphan-key") {
     await env.auth.set(prefix + "active-instance:current", {
@@ -1057,7 +1082,7 @@ test("connect waits for an in-progress key removal before choosing an identity",
   const { createInstanceConnection } = await import("../src/remote/connection.ts");
   const entered = deferred(), release = deferred();
   const connection = createInstanceConnection({ getAppId: () => env.namespace, data: env.data,
-    hasLegacyBucket: () => false, auth: { ...env.auth, removePrefix: async prefix => {
+    auth: { ...env.auth, removePrefix: async prefix => {
       entered.resolve(); await release.promise;
       for (const key of await env.auth.keys(prefix)) await env.auth.remove(key);
     } } });
@@ -1070,4 +1095,315 @@ test("connect waits for an in-progress key removal before choosing an identity",
   const { wire } = await env.approve(); await connecting;
   assert.notEqual(wire.mf_instance_id, old.instanceId);
   assert.equal((await connection.getKey()).instanceId, wire.mf_instance_id);
+});
+
+test("autoSync false retains Local CRUD and manual sync without post-write network work", async t => {
+  const env = browser(t), instance = env.instance(), local = instance.getBucket();
+  const connecting = instance.connect({ autoSync: false }); await env.approve(); await connecting;
+  assert.equal(local.state, "connected");
+  assert.equal(await env.data.get("meta:actor"), null);
+  const before = env.calls.length;
+  await local.put("note", { text: "manual" });
+  await new Promise(resolve => setTimeout(resolve, 900));
+  assert.equal(env.calls.length, before);
+  assert.equal((await local.get("note")).text, "manual");
+  await local.sync();
+  assert.ok(env.calls.some(call => call.url.pathname.endsWith("/objects:index")));
+  const uploads = env.calls.filter(call => call.method === "POST" && call.body instanceof FormData);
+  assert.equal(uploads.length, 1);
+  const meta = JSON.parse(uploads[0].body.get("versionMeta"));
+  assert.ok(meta.objectId.startsWith("ob_"));
+  assert.equal(meta.kind, "create");
+  assert.deepEqual(JSON.parse(uploads[0].body.get("headState")).fieldSources, {});
+  assert.equal((await local.get("note")).text, "manual");
+  await instance.disconnect();
+  await assert.rejects(local.sync(), error => error.name === "NotConnectedError");
+});
+
+test("default Instance connection starts Local synchronization and reuses the connected session", async t => {
+  const env = browser(t), instance = env.instance({ autoSync: true }), local = instance.getBucket();
+  await local.put("note", { text: "automatic" });
+  const connecting = instance.connect(); await env.approve(); assert.equal(await connecting, "connected");
+  await until(() => env.calls.some(call => call.method === "POST" && call.body instanceof FormData));
+  await until(() => env.calls.some(call => call.url.pathname.endsWith("/objects:index")));
+  const sessions = env.calls.filter(call => call.url.pathname.endsWith("instance-session")).length;
+  const heads = env.calls.filter(call => call.url.pathname.endsWith("/current")).length;
+  assert.equal(await instance.connect(), "connected");
+  assert.equal(env.calls.filter(call => call.url.pathname.endsWith("instance-session")).length, sessions);
+  assert.equal(env.calls.filter(call => call.url.pathname.endsWith("/current")).length, heads);
+  await local.disconnect();
+  assert.equal(instance.state, "disconnected");
+  await assert.rejects(instance.remote.getBucket().getCurrent("note"), code("NOT_AUTHORIZED"));
+});
+
+test("connect validates saved access with the server while resume can reuse its session", async t => {
+  const env = browser(t), first = env.instance();
+  const connecting = first.connect({ autoSync: false }); await env.approve(); await connecting; stop(first);
+  const sessionCalls = () => env.calls.filter(call => call.url.pathname.endsWith("instance-session")).length;
+  const count = sessionCalls(), restored = env.instance();
+  assert.equal(await restored.resume({ autoSync: false }), "connected");
+  assert.equal(sessionCalls(), count); stop(restored);
+  const explicit = env.instance();
+  assert.equal(await explicit.connect({ autoSync: false }), "connected");
+  assert.equal(sessionCalls(), count + 1);
+  await explicit.connect({ autoSync: false });
+  assert.equal(sessionCalls(), count + 1);
+});
+
+test("disconnecting the default resource leaves another bucket connected", async t => {
+  const env = browser(t), instance = env.instance(), other = instance.createBucket({ id: "archive.example.com" });
+  const first = instance.connect({ autoSync: false }); await env.approve(); await first;
+  const second = other.connect({ autoSync: false });
+  await until(() => env.opened.length === 2); const { wire } = await env.approve(); await second;
+  assert.equal(wire.resource_id, "urn:myfield:bucket:archive.example.com");
+  await instance.disconnect();
+  assert.equal(other.state, "connected");
+  assert.equal(await other.resume(), "connected");
+  await other.disconnect();
+});
+
+test("simultaneous bucket authorizations keep their windows and callbacks isolated", async t => {
+  const env = browser(t), instance = env.instance(), other = instance.createBucket({ id: "archive.example.com" });
+  const first = instance.connect({ autoSync: false });
+  await until(() => env.opened[0]?.location.href.includes("authRequest"));
+  const second = other.connect({ autoSync: false });
+  await until(() => env.opened[1]?.location.href.includes("authRequest"));
+  const wire = decodeAuthRequestFragment(env.opened[0].location.href);
+  const callback = await buildApprovedCallback(wire, env.win.location.href);
+  env.send(callback.callbackUrl, env.opened[1]);
+  await tick(); assert.equal(instance.state, "connecting");
+  env.send(callback.callbackUrl, env.opened[0]);
+  assert.equal(await first, "connected");
+  assert.equal(other.state, "connecting");
+  await env.approve(); assert.equal(await second, "connected");
+  await instance.disconnect();
+  assert.equal(other.state, "connected");
+});
+
+test("shared authorization cancellation rejects Instance callers and resolves legacy callers with state", async t => {
+  const env = browser(t), instance = env.instance(), local = instance.getBucket();
+  const first = instance.connect({ autoSync: false }), rejected = assert.rejects(first, code("NOT_AUTHORIZED"));
+  const second = local.connect({ autoSync: false });
+  await until(() => env.opened[0]?.location.href.includes("authRequest"));
+  env.opened[0].close();
+  await rejected;
+  assert.equal(await second, "disconnected");
+  assert.equal(env.opened.length, 1);
+});
+
+for (const authBase of ["https://myfield.one/auth/", "https://MYFIELD.ONE/auth"])
+test(`legacy connect joins Instance authorization at ${authBase}`, async t => {
+  const env = browser(t), instance = env.instance();
+  const first = instance.connect({ autoSync: false });
+  const second = instance.getBucket().connect({ authBase, autoSync: false });
+  await env.approve();
+  assert.deepEqual(await Promise.all([first, second]), ["connected", "connected"]);
+  assert.equal(env.opened.length, 1);
+});
+
+test("legacy connect joins saved custom authorization without changing its address", async t => {
+  const env = browser(t), original = env.instance();
+  const first = original.getBucket().connect({ authBase: "https://custom.example/auth/", autoSync: false });
+  await env.approve(); await first; stop(original);
+  const entered = deferred(), release = deferred();
+  t.after(() => release.resolve());
+  env.setHandler(async call => {
+    if (call.url.pathname.endsWith("/current")) return Response.json({ versionId: null, headVersionMeta: null });
+    assert.ok(call.url.pathname.endsWith("instance-challenge") || call.url.pathname.endsWith("instance-session"));
+    if (call.url.pathname.endsWith("instance-challenge")) return Response.json({ challengeId: "challenge", challenge: "value" });
+    entered.resolve(); await release.promise;
+    return Response.json({ credential: { carrier: "bearer", token: "renewed", expiresAt: new Date(Date.now() + 3600_000).toISOString() } });
+  });
+  const instance = env.instance();
+  await instance.getBucket().ready();
+  const restoring = instance.connect({ autoSync: false });
+  await entered.promise;
+  const joined = instance.getBucket().connect({ authBase: "https://custom.example/auth", autoSync: false });
+  await tick();
+  release.resolve();
+  assert.deepEqual(await Promise.all([restoring, joined]), ["connected", "connected"]);
+  assert.equal((await env.data.get(`meta:${env.namespace}:endpoints`)).authBase, "https://custom.example/auth/");
+  assert.equal(env.opened.length, 1);
+});
+
+test("a concurrent legacy connect cannot change the authorization service", async t => {
+  const env = browser(t), instance = env.instance();
+  const first = instance.connect({ autoSync: false });
+  await until(() => env.opened[0]?.location.href.includes("authRequest"));
+  await assert.rejects(instance.getBucket().connect({ authBase: "https://other.example/auth/", autoSync: false }), code("INVALID_STATE"));
+  assert.equal(instance.state, "connecting");
+  await env.approve(); assert.equal(await first, "connected");
+  assert.equal((await env.data.get(`meta:${env.namespace}:endpoints`)).authBase, "https://myfield.one/auth/");
+  assert.equal(env.opened.length, 1);
+});
+
+test("an empty legacy authBase preserves the saved authorization address", async t => {
+  const env = browser(t), instance = env.instance(), local = instance.getBucket();
+  const connecting = local.connect({ authBase: "https://custom.example/auth/", autoSync: false });
+  await env.approve(); assert.equal(await connecting, "connected");
+  assert.equal(await local.connect({ authBase: "" }), "connected");
+  assert.equal((await env.data.get(`meta:${env.namespace}:endpoints`)).authBase, "https://custom.example/auth/");
+});
+
+test("Local CAS rejection retries without marking an unaccepted write as synchronized", async t => {
+  const env = browser(t), instance = env.instance(), local = instance.getBucket();
+  const connecting = instance.connect({ autoSync: false }); await env.approve(); await connecting;
+  await local.put("note", { text: "pending" });
+  let uploads = 0;
+  const failures = [];
+  instance.on("state", (_state, error) => { if (error) failures.push(error); });
+  env.setHandler(call => {
+    if (call.url.pathname.endsWith("/objects:index")) return Response.json({ objects: [], feedCursor: null, hasMoreFeed: false });
+    if (call.url.pathname.endsWith("/current")) return Response.json({ versionId: null });
+    uploads++;
+    return Response.json({ ok: false, reason: "version-mismatch" });
+  });
+  await local.sync();
+  assert.ok(failures.some(error => error.message.includes("CAS attempt limit")));
+  assert.equal(uploads, 5);
+  assert.equal((await local.get("note")).text, "pending");
+  env.resetHandler();
+  await local.sync();
+  assert.ok(env.calls.some(call => call.body instanceof FormData));
+});
+
+test("an old Local activation failure cannot disconnect a newer authorization flow", async t => {
+  const env = browser(t), instance = env.instance({ autoSync: true });
+  const entered = deferred(), release = deferred();
+  env.setHandler(call => {
+    if (call.url.pathname.endsWith("instance-challenge")) return Response.json({ challengeId: "challenge", challenge: "value" });
+    if (call.url.pathname.endsWith("instance-session")) return Response.json({ credential: { carrier: "bearer", token: "token", expiresAt: new Date(Date.now() + 3 * 3600_000).toISOString() } });
+    entered.resolve(); return release.promise;
+  });
+  const old = instance.connect(); const rejected = assert.rejects(old, error => error.name === "AbortError");
+  await env.approve(); await entered.promise;
+  await instance.disconnect(); env.resetHandler();
+  const next = instance.connect();
+  release.resolve(Response.json({ versionId: null }));
+  await rejected;
+  await until(() => env.opened.length === 2); await env.approve();
+  assert.equal(await next, "connected");
+  assert.equal(instance.state, "connected");
+});
+
+test("Local verification network failure keeps shared access and sessions", async t => {
+  const env = browser(t), instance = env.instance({ autoSync: true });
+  const failures = [];
+  instance.on("state", (_state, error) => { if (error) failures.push(error); });
+  env.setHandler(call => {
+    if (call.url.pathname.endsWith("instance-challenge")) return Response.json({ challengeId: "challenge", challenge: "value" });
+    if (call.url.pathname.endsWith("instance-session")) return Response.json({ credential: { carrier: "bearer", token: "token", expiresAt: new Date(Date.now() + 3 * 3600_000).toISOString() } });
+    throw new TypeError("Offline");
+  });
+  const connecting = instance.connect();
+  await env.approve();
+  assert.equal(await connecting, "connected");
+  assert.equal(instance.state, "connected");
+  assert.equal(instance.getBucket().state, "connected");
+  assert.ok(failures.some(error => error.code === "NETWORK_ERROR" && error.retryable));
+  assert.equal((await env.auth.keys("instance:app.example.com:context:")).length, 1);
+  assert.equal((await env.auth.keys("instance:app.example.com:session:")).length, 1);
+  env.resetHandler();
+  assert.equal(await instance.remote.getBucket().getCurrent("note"), null);
+  assert.equal(await instance.resume(), "connected");
+  assert.equal(env.opened.length, 1);
+});
+
+test("Local verification authorization failure disconnects shared access", async t => {
+  const env = browser(t), instance = env.instance({ autoSync: true });
+  env.setHandler(call => {
+    if (call.url.pathname.endsWith("instance-challenge")) return Response.json({ challengeId: "challenge", challenge: "value" });
+    if (call.url.pathname.endsWith("instance-session")) return Response.json({ credential: { carrier: "bearer", token: "token", expiresAt: new Date(Date.now() + 3 * 3600_000).toISOString() } });
+    return Response.json({ code: "GRANT_REVOKED" }, { status: 403 });
+  });
+  const connecting = instance.connect(), failed = assert.rejects(connecting, code("NOT_AUTHORIZED"));
+  await env.approve(); await failed;
+  assert.equal(instance.state, "disconnected");
+});
+
+test("legacy authBase is used as the exact authorization page without endpoint inference", async t => {
+  const env = browser(t), local = env.instance().getBucket();
+  await assert.rejects(local.connect({ authBase: "/auth/" }), code("INVALID_INPUT"));
+  await assert.rejects(local.connect({ authBase: "https://custom.example/auth/?x=1" }), code("INVALID_INPUT"));
+  assert.equal(env.opened.length, 0);
+  const first = local.connect({ authBase: "https://dev.myfield.space", autoSync: false });
+  await until(() => env.opened[0]?.location.href.includes("authRequest"));
+  const page = new URL(env.opened[0].location.href);
+  assert.equal(page.origin + page.pathname, "https://dev.myfield.space/");
+  await env.approve();
+  assert.equal(await first, "connected");
+  assert.deepEqual(await env.data.get(`meta:${env.namespace}:endpoints`), {
+    authBase: "https://dev.myfield.space/", apiBase: "https://api.example.test",
+  });
+  assert.equal(env.calls.some(call => call.url.hostname === "api-dev.myfield.space"), false);
+  assert.equal(env.opened.length, 1);
+});
+
+test("a repeated legacy connect with an equivalent authBase joins the pending flow", async t => {
+  const env = browser(t), local = env.instance().getBucket();
+  const first = local.connect({ authBase: "https://custom.example/auth", autoSync: false });
+  await until(() => env.opened[0]?.location.href.includes("authRequest"));
+  const second = local.connect({ authBase: "https://custom.example/auth/", autoSync: false });
+  await env.approve();
+  assert.deepEqual(await Promise.all([first, second]), ["connected", "connected"]);
+  assert.equal(env.opened.length, 1);
+});
+
+test("legacy connect rejects outside a browser and resolves flow failures with a state error", async t => {
+  const env = browser(t), local = env.instance().getBucket();
+  const details = [];
+  local.on("state", (state, detail) => { if (detail) details.push([state, detail]); });
+  const connecting = local.connect({ autoSync: false });
+  await until(() => env.opened[0]?.location.href.includes("authRequest"));
+  env.opened[0].close();
+  assert.equal(await connecting, "disconnected");
+  assert.equal(details.at(-1)?.[0], "disconnected");
+  const saved = globalThis.window;
+  delete globalThis.window;
+  try {
+    await assert.rejects(local.connect(), code("INVALID_STATE"));
+    assert.equal(await local.resume(), "disconnected");
+  } finally { globalThis.window = saved; }
+});
+
+test("disposing the default Local handle releases it without disconnecting the Instance", async t => {
+  const env = browser(t), instance = env.instance({ autoSync: true });
+  const connecting = instance.connect(); await env.approve(); await connecting;
+  const old = instance.getBucket();
+  old.dispose();
+  const next = instance.getBucket();
+  assert.notEqual(next, old);
+  assert.equal(next.state, "connected");
+  assert.equal(await instance.connect(), "connected");
+  assert.equal(instance.state, "connected");
+  await next.put("note", { text: "after dispose" });
+  await next.sync();
+  assert.ok(env.calls.some(call => call.body instanceof FormData));
+});
+
+test("disposing a connected non-default Local handle releases its connection", async t => {
+  const env = browser(t), instance = env.instance();
+  const archive = instance.createBucket({ id: "archive.example.com" });
+  const connecting = archive.connect({ autoSync: false }); await env.approve();
+  assert.equal(await connecting, "connected");
+  await assert.rejects(instance.removeKey(), code("INVALID_STATE"));
+  archive.dispose();
+  const reopened = instance.createBucket({ id: "archive.example.com" });
+  assert.notEqual(reopened, archive);
+  assert.equal(reopened.state, "disconnected");
+  assert.equal(await reopened.resume(), "connected");
+  assert.equal(env.opened.length, 1);
+  reopened.dispose();
+  await instance.removeKey();
+  assert.equal(await instance.getKey(), null);
+});
+
+for (const revoked of [false, true])
+test(`Local 403 ${revoked ? "GRANT_REVOKED disconnects shared access" : "capability mismatch keeps access"}`, async t => {
+  const env = browser(t), instance = env.instance(), local = instance.getBucket();
+  const connecting = instance.connect({ autoSync: false }); await env.approve(); await connecting;
+  env.setHandler(() => Response.json({ code: revoked ? "GRANT_REVOKED" : "GRANT_CAPABILITY_MISMATCH" }, { status: 403 }));
+  await assert.rejects(local.sync());
+  assert.equal(instance.state, revoked ? "disconnected" : "connected");
+  assert.equal(local.state, instance.state);
 });
