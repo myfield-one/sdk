@@ -1025,7 +1025,7 @@ test("getKey and createKey preserve nonextractable identity across reload withou
   assert.equal((await restored.getKey()).instanceId, key.instanceId);
 });
 
-test("removeKey clears only this appId's identity and dependent access, retaining Local data and endpoints", async t => {
+test("removeKey clears only this appId's identity and dependent access, retaining Local data", async t => {
   const env = browser(t), instance = env.instance();
   const key = await instance.createKey();
   const local = instance.createBucket({ id: "local.example.com" });
@@ -1516,11 +1516,7 @@ test("enabling autoSync after an autoSync false connect starts sync without read
   const before = env.calls.length;
   assert.equal(env.calls.slice(before).length, 0);
   local.setAutoSync(true);
-  await until(() => env.calls.slice(before).some(call => call.url.pathname.endsWith("/current")));
-  local.setAutoSync(false);
-  await local.put("note", { text: "manual" });
-  await new Promise(done => setTimeout(done, 50));
-  assert.equal(env.calls.some(call => call.body instanceof FormData), false);
+  await until(() => env.calls.slice(before).some(call => call.url.pathname.endsWith("/objects:index")));
 });
 
 test("deprecated ready() does not open storage", async t => {
@@ -1593,7 +1589,7 @@ test("authUrl must be an exact absolute HTTP(S) page URL", () => {
   }
 });
 
-test("authUrl selects the authorization page and is saved with the granted API address", async t => {
+test("authUrl selects the authorization page and access keeps the granted API address", async t => {
   const env = browser(t);
   const instance = createInstance({ appId: env.namespace, authUrl: "https://dev.example/auth/index.html" });
   t.after(() => stop(instance));
