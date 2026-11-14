@@ -621,7 +621,7 @@ function createBucketFacade(deps: BucketDeps) {
     list,
     resume: () => connectLegacy(false),
     connect(options) {
-      if (options && typeof options === "object" && "authBase" in options) {
+      if (options && typeof options === "object" && (options as { authBase?: unknown }).authBase !== undefined) {
         return Promise.reject(new ClientError("INVALID_INPUT", "Pass the authorization page as createInstance({ authUrl })"));
       }
       if (options?.autoSync !== undefined) this.setAutoSync(options.autoSync);

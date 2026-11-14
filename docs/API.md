@@ -22,9 +22,9 @@ createInstance(options?: {
 1–63 characters.
 
 `authUrl` is the Auth page opened when authorization is needed, for example a dev page.
-It must be an exact absolute HTTP(S) page URL and applies to every bucket of the
-Instance. Only the API address returned by authorization is saved; saved access keeps
-using it after `authUrl` changes. To switch environments on one origin, use a separate
+It must be an absolute HTTP(S) page URL without credentials, query or fragment, is used
+as given and applies to every bucket of the Instance. Saved access keeps the API address
+returned by authorization, also after `authUrl` changes. To switch environments on one origin, use a separate
 `namespace` per environment, or call `disconnect()` before `connect()`.
 
 ## Buckets
@@ -248,7 +248,7 @@ returns metadata and a payload Response; consume or cancel its body.
 to authorize or recover from `NOT_AUTHORIZED`; network failures never open authorization.
 Both return the connection state; `on("state")` reports changes and errors.
 `disconnect()` clears shared bucket access and pending requests across tabs,
-retaining keys, objects and endpoints.
+retaining keys and objects.
 
 `commit()` submits app-encoded metadata and encrypted bytes against
 `expectedHeadVersionId`; null requests creation. The app owns encryption and merge.

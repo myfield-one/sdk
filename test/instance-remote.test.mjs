@@ -8,6 +8,10 @@ import { createIndexedDbStorageAdapter } from "../src/bucket/store.ts";
 import { decodeAuthRequestFragment, buildApprovedCallback } from "./auth-fixture.mjs";
 
 const stop = instance => instanceTestCleanup.get(instance)?.();
+async function grantedApiOrigin(storage, appId, bucketId = appId) {
+  const keys = await storage.keys(`instance:${appId}:context:${encodeURIComponent(`urn:myfield:bucket:${bucketId}`)}:`);
+  return keys.length === 1 ? new URL((await storage.get(keys[0])).resourceApiUrl).origin : null;
+}
 
 const code = expected => error => error instanceof ClientError && error.code === expected;
 const deferred = () => {
@@ -123,14 +127,15 @@ test("initialization is inert, selects same-named bucket and validates namespace
   assert.equal("dispose" in a, false);
 });
 
-test("connect joins authorization, persists legacy context/endpoints and uses callback remote bucket", async t => {
+test("connect joins authorization, persists the granted context and uses callback remote bucket", async t => {
   const env = browser(t), instance = env.instance();
   const first = instance.connect();
   assert.equal(instance.connect(), first);
   const { wire } = await env.approve({ remoteBucketId: "remote.example.com" });
   await first;
   assert.equal(wire.resource_id, `urn:myfield:bucket:${env.namespace}`);
-  assert.deepEqual(await env.data.get(`meta:${env.namespace}:endpoints`), { apiBase: "https://api.example.test" });
+  assert.equal(await grantedApiOrigin(env.auth, env.namespace), "https://api.example.test");
+  assert.equal(await env.data.get(`meta:${env.namespace}:endpoints`), null);
   const auth = createInstanceAuthClient({ appId: "app.example.com", storage: env.auth });
   const context = await auth.getContext(env.namespace);
   assert.equal(context.v, 1); assert.equal(context.resourceApiUrl, "https://api.example.test/v1/api/sync");
@@ -150,14 +155,13 @@ test("connect joins authorization, persists legacy context/endpoints and uses ca
   legacy.dispose();
 });
 
-test("disconnect clears access but preserves endpoints, identity and data", async t => {
+test("disconnect clears access but preserves identity and data", async t => {
   const env = browser(t), instance = env.instance();
   await env.data.set("data:unrelated:obj:note", { text: "local" });
   const first = instance.connect(); await env.approve(); await first;
   const before = await env.auth.get("instance:app.example.com:active-instance:current");
   const handle = instance.remote.getBucket();
   await instance.disconnect();
-  assert.equal((await env.data.get(`meta:${env.namespace}:endpoints`))?.apiBase, "https://api.example.test");
   assert.deepEqual(await env.auth.get("instance:app.example.com:active-instance:current"), before);
   assert.deepEqual(await env.data.get("data:unrelated:obj:note"), { text: "local" });
   assert.equal((await env.auth.keys("instance:app.example.com:context:")).length, 0);
@@ -185,7 +189,7 @@ test("saved access failures retain grants without prompting, and disconnect allo
     : Response.json({ credential: { carrier: "bearer", token: "new", expiresAt: new Date(Date.now() + 7200_000).toISOString() } }));
   const again = instance.connect(); await until(() => env.opened.length === 2);
   await env.approve({ apiBase: "https://custom-api.example" }); await again;
-  assert.equal((await env.data.get(`meta:${env.namespace}:endpoints`)).apiBase, "https://custom-api.example");
+  assert.equal(await grantedApiOrigin(env.auth, env.namespace), "https://custom-api.example");
 });
 
 test("same-named legacy Bucket and Instance share authorization", async t => {
@@ -278,13 +282,13 @@ test("callback identity changes cannot overwrite context or active identity", as
   assert.equal((await env.auth.get("instance:app.example.com:active-instance:current")).instanceId, "inst_" + "a".repeat(32));
 });
 
-test("session failure after approval keeps endpoints and resumes after reopening", async t => {
+test("session failure after approval keeps the grant and resumes after reopening", async t => {
   const env = browser(t); let instance = env.instance();
   env.setHandler(() => new Response("unavailable", { status: 503 }));
   const connecting = instance.connect(); const failed = assert.rejects(connecting, error => error.status === 503 && error.retryable);
   await env.approve(); await failed;
   assert.equal((await env.auth.keys("instance:app.example.com:context:")).length, 1);
-  assert.equal((await env.data.get(`meta:${env.namespace}:endpoints`)).apiBase, "https://api.example.test");
+  assert.equal(await grantedApiOrigin(env.auth, env.namespace), "https://api.example.test");
   stop(instance); instance = env.instance();
   env.setHandler(call => call.url.pathname.endsWith("instance-challenge")
     ? Response.json({ challengeId: "next", challenge: "next" })
@@ -829,7 +833,8 @@ test("appId selects authorization independently from legacy storage scope", asyn
   const db = createIndexedDbStorageAdapter({ dbName: "myfield-sdk:default" });
   assert.equal((await db.keys("auth:instance:notes.example.com:instance-key:")).length, 1);
   assert.equal((await db.keys("auth:instance:app.example.com:")).length, 0);
-  assert.deepEqual(await db.get("meta:notes.example.com:endpoints"), { apiBase: "https://api.example.test" });
+  const auth = { keys: async prefix => (await db.keys(`auth:${prefix}`)).map(key => key.slice(5)), get: key => db.get(`auth:${key}`) };
+  assert.equal(await grantedApiOrigin(auth, "notes.example.com"), "https://api.example.test");
 });
 
 test("no-argument initialization resumes existing hostname identity in the default database", async t => {
@@ -1219,7 +1224,7 @@ test("legacy connect joins saved custom authorization without changing its addre
   await tick();
   release.resolve();
   assert.deepEqual(await Promise.all([restoring, joined]), ["connected", "connected"]);
-  assert.equal((await env.data.get(`meta:${env.namespace}:endpoints`)).apiBase, "https://api.example.test");
+  assert.equal(await grantedApiOrigin(env.auth, env.namespace), "https://api.example.test");
   assert.equal(env.opened.length, 1);
 });
 
@@ -1230,7 +1235,7 @@ test("bucket connect rejects a per-call authBase without affecting a pending flo
   await assert.rejects(instance.getBucket().connect({ authBase: "https://other.example/auth/", autoSync: false }), code("INVALID_INPUT"));
   assert.equal(instance.state, "connecting");
   await env.approve(); assert.equal(await first, "connected");
-  assert.equal((await env.data.get(`meta:${env.namespace}:endpoints`)).apiBase, "https://api.example.test");
+  assert.equal(await grantedApiOrigin(env.auth, env.namespace), "https://api.example.test");
   assert.equal(env.opened.length, 1);
 });
 
@@ -1331,7 +1336,7 @@ test(`${legacy ? "Bucket" : "Instance"} connect waiting for resume handles ${res
   } else if (result === "success") {
     assert.equal(await resumeResult, "connected");
     assert.equal(await connectResult, "connected");
-    assert.equal((await env.data.get(`meta:${env.namespace}:endpoints`)).apiBase, "https://api.example.test");
+    assert.equal(await grantedApiOrigin(env.auth, env.namespace), "https://api.example.test");
   } else {
     const error = await resumeResult;
     assert.equal(error.name === "AbortError" || ["NETWORK_ERROR", "NOT_AUTHORIZED"].includes(error.code), true);
@@ -1428,7 +1433,8 @@ test("authUrl is used as the exact authorization page without endpoint inference
   assert.equal(page.origin + page.pathname, "https://auth.example.test/");
   await env.approve();
   assert.equal(await first, "connected");
-  assert.deepEqual(await env.data.get(`meta:${env.namespace}:endpoints`), { apiBase: "https://api.example.test" });
+  assert.equal(await grantedApiOrigin(env.auth, env.namespace), "https://api.example.test");
+  assert.equal(await env.data.get(`meta:${env.namespace}:endpoints`), null);
   assert.equal(env.calls.some(call => call.url.hostname === "api.auth.example.test"), false);
   assert.equal(env.opened.length, 1);
 });
@@ -1589,14 +1595,15 @@ test("authUrl must be an exact absolute HTTP(S) page URL", () => {
 
 test("authUrl selects the authorization page and is saved with the granted API address", async t => {
   const env = browser(t);
-  const instance = createInstance({ appId: env.namespace, authUrl: "https://dev.example/auth" });
+  const instance = createInstance({ appId: env.namespace, authUrl: "https://dev.example/auth/index.html" });
   t.after(() => stop(instance));
   const connecting = instance.connect({ autoSync: false });
   await until(() => env.opened[0]?.location.href.includes("authRequest"));
-  assert.equal(pageOf(env.opened[0]), DEV_AUTH);
+  assert.equal(pageOf(env.opened[0]), "https://dev.example/auth/index.html");
   await env.approve();
   assert.equal(await connecting, "connected");
-  assert.deepEqual(await env.data.get(`meta:${env.namespace}:endpoints`), { apiBase: "https://api.example.test" });
+  assert.equal(await grantedApiOrigin(env.auth, env.namespace), "https://api.example.test");
+  assert.equal(await env.data.get(`meta:${env.namespace}:endpoints`), null);
 });
 
 test("changing authUrl only selects where to authorize; saved access keeps its API address", async t => {
@@ -1615,11 +1622,16 @@ test("every bucket of an Instance uses its authUrl", async t => {
   const instance = createInstance({ appId: env.namespace, authUrl: DEV_AUTH });
   t.after(() => stop(instance));
   await assert.rejects(instance.getBucket().connect({ authBase: "https://custom.example/auth/" }), code("INVALID_INPUT"));
-  const archive = instance.createBucket({ id: "archive.example.com" }).connect({ autoSync: false });
+  const passthrough = instance.getBucket().connect({ authBase: undefined, autoSync: false });
   await until(() => env.opened[0]?.location.href.includes("authRequest"));
   assert.equal(pageOf(env.opened[0]), DEV_AUTH);
   await env.approve();
+  assert.equal(await passthrough, "connected");
+  const archive = instance.createBucket({ id: "archive.example.com" }).connect({ autoSync: false });
+  await until(() => env.opened.length === 2 && env.opened[1].location.href.includes("authRequest"));
+  assert.equal(pageOf(env.opened[1]), DEV_AUTH);
+  await env.approve();
   assert.equal(await archive, "connected");
-  assert.deepEqual(await env.data.get("meta:archive.example.com:endpoints"), { apiBase: "https://api.example.test" });
+  assert.equal(await grantedApiOrigin(env.auth, env.namespace, "archive.example.com"), "https://api.example.test");
 });
 

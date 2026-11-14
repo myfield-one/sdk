@@ -13,8 +13,7 @@ import type { BucketAccess } from "../auth/types.ts";
 const DEFAULT_AUTH_URL = "https://myfield.one/auth/";
 type ConnectionState = "disconnected" | "connecting" | "connected";
 type StateListener = (state: ConnectionState, error?: ClientError) => void;
-type ConnectionFlow = { controller: AbortController; readonly prompt: boolean;
-  prepared: Promise<{ establish(): Promise<ConnectionState> }>; promise: Promise<ConnectionState> };
+type ConnectionFlow = { controller: AbortController; readonly prompt: boolean; promise: Promise<ConnectionState> };
 
 function notAuthorized(message: string, cause?: unknown): ClientError {
   return new ClientError("NOT_AUTHORIZED", message, {
@@ -47,7 +46,6 @@ export function normalizeAuthUrl(value: string): string {
   if (!/^https?:$/.test(url.protocol) || url.username || url.password || url.search || url.hash) {
     throw new ClientError("INVALID_INPUT", "authUrl must be an HTTP(S) page URL without credentials, query or fragment");
   }
-  url.pathname = url.pathname.replace(/\/+$/, "") + "/";
   return url.href;
 }
 
@@ -71,7 +69,7 @@ export function createInstanceConnection(deps: {
   persistent?: boolean;
   authUrl?: string;
 }) {
-  let bucketId: string, resourceId: string, endpointsKey: string;
+  let bucketId: string, resourceId: string;
   const storageAppId = deps.getAppId;
   let remoteClient: RemoteClient | null = null;
   let localAccess: { access: BucketAccess; signal: AbortSignal; fetch: typeof fetch;
@@ -98,7 +96,6 @@ export function createInstanceConnection(deps: {
     assertRuntime();
     bucketId = deps.getBucketId?.() ?? storageAppId();
     resourceId = `urn:myfield:bucket:${bucketId}`;
-    endpointsKey = authRecordKeys(storageAppId()).endpoints(bucketId);
   }
 
   function assertKeyMutable() {
@@ -278,11 +275,10 @@ export function createInstanceConnection(deps: {
     let auth = makeAuth();
     let context = await auth.getContext(bucketId);
     return { establish: async (): Promise<ConnectionState> => {
-      const publish = async (next: InstanceAuthContext, approved: boolean) => {
+      const publish = async (next: InstanceAuthContext) => {
         signal.throwIfAborted();
         emitState("connecting");
         const apiBase = apiOrigin(next.resourceApiUrl || "");
-        if (approved) await queue(signal, () => deps.data.set(endpointsKey, { apiBase }));
         auth = makeAuth(apiBase);
         let access;
         try { access = await auth.getBucketAccess(bucketId); }
@@ -321,14 +317,12 @@ export function createInstanceConnection(deps: {
 
       try {
         const pageUrl = new URL(window.location.href);
-        let approved = false;
         if (await ownCallback(pageUrl, storage)) {
           emitState("connecting");
           await handleCallback(auth, pageUrl, signal, true);
-          approved = true;
           context = await auth.getContext(bucketId);
         }
-        if (context) return await publish(context, approved);
+        if (context) return await publish(context);
       } catch (error) {
         signal.throwIfAborted();
         const failure = connectionError(error);
@@ -343,7 +337,7 @@ export function createInstanceConnection(deps: {
       await requestAuthorization(auth, storage, authUrl, signal, popup => { authorizationPopup = popup; });
       context = await auth.getContext(bucketId);
       if (!context) throw notAuthorized("Authorization context unavailable");
-      return publish(context, true);
+      return publish(context);
     } };
   }
 
@@ -431,10 +425,10 @@ export function createInstanceConnection(deps: {
       return flow.promise;
     }
     const controller = new AbortController();
-    const current: ConnectionFlow = { controller, prompt, prepared: null!, promise: null! };
+    const current: ConnectionFlow = { controller, prompt, promise: null! };
     connectionController = controller;
-    current.prepared = Promise.all([cleanup, keyChanges]).then(() => prepare(current));
-    current.promise = current.prepared.then(prepared => prepared.establish()).catch(async error => {
+    current.promise = Promise.all([cleanup, keyChanges]).then(() => prepare(current))
+      .then(prepared => prepared.establish()).catch(async error => {
       if (controller.signal.aborted) throw controller.signal.reason;
       const failure = connectionError(error);
       controller.abort(failure);
