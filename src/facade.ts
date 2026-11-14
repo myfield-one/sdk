@@ -59,6 +59,7 @@ export type Bucket = {
   readonly id: string;
   readonly state: BucketState;
   binary(input: BinaryInput | BucketBinaryValue, options?: BinaryOptions): BucketBinaryValue;
+  /** @deprecated No-op kept for compatibility; operations initialize storage lazily. */
   ready(): Promise<void>;
   put(objectId: string, object: Record<string, unknown>): Promise<void>;
   get(objectId: string): Promise<Record<string, unknown> | null>;
@@ -516,11 +517,16 @@ function createBucketFacade(deps: BucketDeps) {
     client?.stop();
   }
 
+  let connectionState = connection.state;
   const stopState = connection.on("state", (next, error) => {
     if (disposed) return;
+    const entered = next === "connected" && connectionState !== "connected";
+    connectionState = next;
     if (next === "disconnected" && error) lastFailure = error;
     if (next === "connected") bindTransport(); else stopLocal();
     emitState(next, error ? formatError(error) : undefined);
+    // Error reports re-emit "connected"; only a new connection starts sync.
+    if (entered) void reconcile().catch(() => {});
   });
   if (state === "connected") bindTransport();
 
@@ -557,13 +563,19 @@ function createBucketFacade(deps: BucketDeps) {
     return operation;
   }
 
+  // Automatic sync runs exactly while the connection is up and autoSync is on.
+  function reconcile(): Promise<void> {
+    if (disposed) return Promise.resolve();
+    if (!autoSync || !liveTransport) { client?.stop(); return Promise.resolve(); }
+    return activate();
+  }
+
   function connectInstance(prompt: boolean, enabled?: boolean): Promise<BucketState> {
     if (enabled !== undefined) bucket.setAutoSync(enabled);
     const operation = prompt ? connection.connect() : connection.resume();
-    if (!autoSync) return operation;
     if (connecting?.operation === operation) return connecting.result;
     const done = operation.then(async next => {
-      if (next === "connected") await activate();
+      if (next === "connected") await reconcile();
       return next;
     }).finally(() => { if (connecting?.result === done) connecting = null; });
     connecting = { operation, result: done };
@@ -587,7 +599,7 @@ function createBucketFacade(deps: BucketDeps) {
       throw error;
     }
     if (next !== "connected") return next;
-    try { await activate(); } catch { return "disconnected"; }
+    try { await reconcile(); } catch { return "disconnected"; }
     return next;
   }
 
@@ -601,9 +613,7 @@ function createBucketFacade(deps: BucketDeps) {
     binary(input, options) {
       return createBucketBinaryValue(input, options);
     },
-    async ready() {
-      await ensureClient();
-    },
+    async ready() {},
     put,
     get: getObject,
     update,
@@ -620,9 +630,7 @@ function createBucketFacade(deps: BucketDeps) {
     },
     setAutoSync(enabled) {
       autoSync = enabled;
-      if (!client) return;
-      if (enabled && liveTransport) startAutoSync();
-      if (!enabled) client.stop();
+      void reconcile().catch(() => {});
     },
     on(event: "state" | "change", handler: (...args: never[]) => void): () => void {
       const set = listeners[event] as Set<(...args: unknown[]) => void>;
@@ -675,9 +683,13 @@ function formatError(error: unknown): string {
 }
 
 function localError(error: unknown, message = formatError(error)): ClientError {
-  if (error instanceof ClientError && message === error.message) return error;
+  if (error instanceof ClientError) {
+    if (message === error.message) return error;
+    return new ClientError(error.code, message, { cause: error, retryable: error.retryable, status: error.status,
+      requestId: error.requestId, retryAfterMs: error.retryAfterMs, maxBytes: error.maxBytes });
+  }
   const retryable = error instanceof BucketTransportError ? error.retryable : error instanceof TypeError;
-  return new ClientError(error instanceof ClientError ? error.code : retryable ? "NETWORK_ERROR" : "SYNC_FAILED", message, {
-    cause: error, retryable, status: error instanceof BucketTransportError || error instanceof ClientError ? error.status : undefined,
+  return new ClientError(retryable ? "NETWORK_ERROR" : "SYNC_FAILED", message, {
+    cause: error, retryable, status: error instanceof BucketTransportError ? error.status : undefined,
   });
 }

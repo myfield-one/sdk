@@ -1407,3 +1407,78 @@ test(`Local 403 ${revoked ? "GRANT_REVOKED disconnects shared access" : "capabil
   assert.equal(instance.state, revoked ? "disconnected" : "connected");
   assert.equal(local.state, instance.state);
 });
+
+test("enabling autoSync after an autoSync false connect starts sync without ready()", async t => {
+  const env = browser(t), instance = env.instance(), local = instance.getBucket();
+  const connecting = instance.connect({ autoSync: false }); await env.approve();
+  assert.equal(await connecting, "connected");
+  await tick();
+  const before = env.calls.length;
+  assert.equal(env.calls.slice(before).length, 0);
+  local.setAutoSync(true);
+  await until(() => env.calls.slice(before).some(call => call.url.pathname.endsWith("/current")));
+  local.setAutoSync(false);
+  await local.put("note", { text: "manual" });
+  await new Promise(done => setTimeout(done, 50));
+  assert.equal(env.calls.some(call => call.body instanceof FormData), false);
+});
+
+test("deprecated ready() does not open storage", async t => {
+  const env = browser(t);
+  let opens = 0;
+  const realOpen = indexedDB.open.bind(indexedDB);
+  indexedDB.open = (...args) => { opens++; return realOpen(...args); };
+  const local = env.instance().getBucket();
+  await local.ready();
+  assert.equal(opens, 0);
+  await local.put("note", { text: "lazy" });
+  assert.ok(opens > 0);
+  assert.equal((await local.get("note")).text, "lazy");
+});
+
+test("automatic sync error details keep retry information from the original error", async t => {
+  const env = browser(t), instance = env.instance({ autoSync: true }), local = instance.getBucket();
+  const connecting = instance.connect(); await env.approve();
+  assert.equal(await connecting, "connected");
+  const failures = [];
+  instance.on("state", (_state, error) => { if (error) failures.push(error); });
+  env.setHandler(call => {
+    if (call.url.pathname.endsWith("instance-challenge")) return Response.json({ challengeId: "challenge", challenge: "value" });
+    if (call.url.pathname.endsWith("instance-session")) return Response.json({ code: "UNAVAILABLE" }, { status: 503, headers: { "retry-after": "7" } });
+    return new Response(null, { status: 401 });
+  });
+  await local.put("note", { text: "pending" });
+  for (let i = 0; i < 300 && !failures.some(error => error.message.startsWith("sync error")); i++) await new Promise(done => setTimeout(done, 10));
+  const failure = failures.find(error => error.message.startsWith("sync error"));
+  assert.ok(failure, JSON.stringify(failures.map(error => [error.code, error.message])));
+  assert.equal(failure.code, "UNAVAILABLE");
+  assert.equal(failure.retryable, true);
+  assert.equal(failure.retryAfterMs, 7000);
+  assert.equal(failure.status, 503);
+  assert.equal(instance.state, "connected");
+});
+
+test("offline sync error reports do not repeat Local verification", async t => {
+  const env = browser(t), instance = env.instance({ autoSync: true }), local = instance.getBucket();
+  const failures = [];
+  instance.on("state", (_state, error) => { if (error) failures.push(error); });
+  env.setHandler(call => {
+    if (call.url.pathname.endsWith("instance-challenge")) return Response.json({ challengeId: "challenge", challenge: "value" });
+    if (call.url.pathname.endsWith("instance-session")) return Response.json({ credential: { carrier: "bearer", token: "token", expiresAt: new Date(Date.now() + 3 * 3600_000).toISOString() } });
+    throw new TypeError("Offline");
+  });
+  const connecting = instance.connect(); await env.approve();
+  assert.equal(await connecting, "connected");
+  const syncErrors = () => failures.filter(error => error.message.startsWith("sync error")).length;
+  const verifications = () => failures.length - syncErrors();
+  await until(() => verifications() === 1 && syncErrors() === 1);
+  await new Promise(done => setTimeout(done, 20));
+  const before = env.calls.length;
+  await local.put("note", { text: "offline" });
+  for (let i = 0; i < 300 && syncErrors() < 2; i++) await new Promise(done => setTimeout(done, 10));
+  await new Promise(done => setTimeout(done, 50));
+  assert.equal(syncErrors(), 2);
+  assert.equal(verifications(), 1);
+  assert.equal(env.calls.slice(before).filter(call => call.url.pathname.endsWith("/current")).length, 1);
+  assert.equal(instance.state, "connected");
+});

@@ -39,6 +39,7 @@ export type Bucket = {
   readonly id: string;
   readonly state: BucketState;
   binary(input: BinaryInput | BucketBinaryValue, options?: BinaryOptions): BucketBinaryValue;
+  /** @deprecated No-op kept for compatibility; operations initialize storage lazily. */
   ready(): Promise<void>;
   put(objectId: string, object: Record<string, unknown>): Promise<void>;
   get(objectId: string): Promise<Record<string, unknown> | null>;

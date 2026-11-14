@@ -8,6 +8,9 @@
   API hosts; pass the full authorization page URL. The API address comes from the grant.
 - Fixed Local sync marking a write synchronized when the server answered HTTP 200 with
   `{ ok: false }`; unauthorized acknowledgements now invalidate access.
+- Automatic sync now follows connection state and `setAutoSync()` without requiring
+  `ready()` or prior Local operations. `bucket.ready()` is a deprecated no-op.
+- Sync error details keep the original retry information (`retryable`, `retryAfterMs`).
 - Add appId initialization and Instance key read/create/import/removal with nonextractable keys.
   String initialization now means appId, which scopes identity and default storage;
   namespace overrides storage scope.

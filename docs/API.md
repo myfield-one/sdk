@@ -51,11 +51,11 @@ instance.createBucket(options: { id: string }): Bucket;
 
 ## Local Object API
 
-Local operations work before `connect()` and never wait for network sync.
+Local operations work before `connect()` and never wait for network sync. They
+initialize storage lazily; storage errors surface on first use. `bucket.ready()` is a
+deprecated no-op kept for compatibility.
 
 ```ts
-bucket.ready(): Promise<void>;
-
 bucket.put(id: string, object: Record<string, unknown>): Promise<void>;
 bucket.update(id: string, fields: Record<string, unknown>): Promise<void>;
 bucket.delete(id: string): Promise<void>;
@@ -182,8 +182,15 @@ const offChange = bucket.on("change", (objectId) => {});
   visibility, or online events.
 - `disconnect()` drops this resource's connection and authorization, retaining Local data.
 
-Legacy bucket resume/connect/disconnect remain supported; bucket.connect also accepts
-`authBase` and `autoSync`. The same resource shares its connection with Instance/Remote.
+Automatic sync runs while the bucket is connected and auto-sync is enabled. It starts
+when connect/resume completes, when the connection becomes active, or on
+`setAutoSync(true)`; handle creation alone does no I/O. `connect({ autoSync })` is
+shorthand for `setAutoSync()` followed by connecting.
+
+Bucket resume/connect/disconnect connect that bucket's own resource. They are the entry
+for buckets from `createBucket()`; prefer Instance methods for the default bucket.
+bucket.connect also accepts `authBase` and `autoSync`. The same resource shares its
+connection with Instance/Remote.
 `authBase` is the exact absolute authorization page URL; no `/auth/` path is appended
 and no API host is inferred. The API address comes from the authorization grant; access
 without a usable one is treated as unauthorized and needs reauthorization. Invalid
