@@ -1326,16 +1326,16 @@ test("legacy authBase is used as the exact authorization page without endpoint i
   await assert.rejects(local.connect({ authBase: "/auth/" }), code("INVALID_INPUT"));
   await assert.rejects(local.connect({ authBase: "https://custom.example/auth/?x=1" }), code("INVALID_INPUT"));
   assert.equal(env.opened.length, 0);
-  const first = local.connect({ authBase: "https://dev.myfield.space", autoSync: false });
+  const first = local.connect({ authBase: "https://auth.example.test", autoSync: false });
   await until(() => env.opened[0]?.location.href.includes("authRequest"));
   const page = new URL(env.opened[0].location.href);
-  assert.equal(page.origin + page.pathname, "https://dev.myfield.space/");
+  assert.equal(page.origin + page.pathname, "https://auth.example.test/");
   await env.approve();
   assert.equal(await first, "connected");
   assert.deepEqual(await env.data.get(`meta:${env.namespace}:endpoints`), {
-    authBase: "https://dev.myfield.space/", apiBase: "https://api.example.test",
+    authBase: "https://auth.example.test/", apiBase: "https://api.example.test",
   });
-  assert.equal(env.calls.some(call => call.url.hostname === "api-dev.myfield.space"), false);
+  assert.equal(env.calls.some(call => call.url.hostname === "api.auth.example.test"), false);
   assert.equal(env.opened.length, 1);
 });
 
