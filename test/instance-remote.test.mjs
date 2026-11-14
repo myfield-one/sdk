@@ -404,13 +404,13 @@ test("resume without access returns disconnected without identity creation or pr
   assert.equal((await env.auth.keys("instance:")).length, 0);
 });
 
-test("resume and user connect join one flow and report isolated state events", async t => {
+test("user connect follows resume and reports isolated state events", async t => {
   const env = browser(t), instance = env.instance(), events = [];
   const unsubscribe = instance.on("state", (state, error) => events.push([state, error?.code]));
   instance.on("state", () => { throw new Error("Application listener failure"); });
   const resuming = instance.resume();
   const connecting = instance.connect();
-  assert.equal(resuming, connecting);
+  assert.equal(await resuming, "disconnected");
   await env.approve();
   assert.equal(await connecting, "connected");
   assert.equal(instance.state, "connected");
@@ -1235,6 +1235,113 @@ test("a concurrent legacy connect cannot change the authorization service", asyn
   await env.approve(); assert.equal(await first, "connected");
   assert.equal((await env.data.get(`meta:${env.namespace}:endpoints`)).authBase, "https://myfield.one/auth/");
   assert.equal(env.opened.length, 1);
+});
+
+test("legacy connect waits for startup resume before selecting its authorization page", async t => {
+  const env = browser(t), local = env.instance().getBucket();
+  const restoring = local.resume();
+  const connecting = local.connect({ authBase: "https://custom.example/auth/", autoSync: false });
+  await until(() => env.opened[0]?.location.href.includes("authRequest"));
+  assert.equal(new URL(env.opened[0].location.href).origin, "https://custom.example");
+  await env.approve();
+  assert.deepEqual(await Promise.all([restoring, connecting]), ["disconnected", "connected"]);
+  assert.equal(env.opened.length, 1);
+});
+
+test("Instance connect waits for startup resume instead of changing its prompt behavior", async t => {
+  const env = browser(t), instance = env.instance();
+  const restoring = instance.resume({ autoSync: false });
+  const first = instance.connect({ autoSync: false });
+  const second = instance.connect({ autoSync: false });
+  assert.equal(await restoring, "disconnected");
+  await env.approve();
+  assert.deepEqual(await Promise.all([first, second]), ["connected", "connected"]);
+  assert.equal(env.opened.length, 1);
+});
+
+test("connect keeps user intent across resume completion microtasks", async t => {
+  const env = browser(t);
+  const { createInstanceConnection } = await import("../src/remote/connection.ts");
+  const { createMemoryStorageAdapter } = await import("../src/bucket/store.ts");
+  for (let delay = 0; delay < 15; delay++) {
+    const auth = createMemoryStorageAdapter();
+    let scheduled = false, connecting, finished = false;
+    const connection = createInstanceConnection({ getAppId: () => env.namespace,
+      data: createMemoryStorageAdapter(), auth: { ...auth, keys: async prefix => {
+        const keys = await auth.keys(prefix);
+        if (!scheduled) {
+          scheduled = true;
+          void (async () => {
+            for (let i = 0; i < delay; i++) await Promise.resolve();
+            connecting = connection.connect().finally(() => { finished = true; });
+          })();
+        }
+        return keys;
+      } } });
+    t.after(() => connection.dispose());
+    const before = env.opened.length, restoring = connection.resume();
+    await until(() => finished || env.opened.length > before && env.opened.at(-1).location.href.includes("authRequest"));
+    if (!finished) await env.approve();
+    assert.equal(await restoring, "disconnected", `resume at offset ${delay}`);
+    assert.equal(await connecting, "connected", `connect at offset ${delay}`);
+    connection.dispose();
+  }
+});
+
+for (const legacy of [false, true])
+for (const result of ["success", "network-error", "revoked", "disconnect", "dispose", "revoked-disconnect"])
+test(`${legacy ? "Bucket" : "Instance"} connect waiting for resume handles ${result}`, async t => {
+  const env = browser(t), original = env.instance();
+  const initial = original.connect({ autoSync: false }); await env.approve(); await initial;
+  stop(original);
+  for (const key of await env.auth.keys("instance:app.example.com:session:")) await env.auth.remove(key);
+  const entered = deferred(), release = deferred();
+  t.after(() => release.resolve());
+  env.setHandler(async call => {
+    if (call.url.pathname.endsWith("instance-challenge")) return Response.json({ challengeId: "challenge", challenge: "value" });
+    entered.resolve(); await release.promise;
+    if (result === "network-error") throw new TypeError("Offline");
+    if (result.startsWith("revoked")) return Response.json({ code: "GRANT_NOT_FOUND" }, { status: 403 });
+    return Response.json({ credential: { carrier: "bearer", token: "restored", expiresAt: new Date(Date.now() + 3600_000).toISOString() } });
+  });
+  const instance = env.instance();
+  await instance.getBucket().get("missing");
+  const restoring = instance.resume({ autoSync: false });
+  const resumeResult = restoring.catch(error => error);
+  await entered.promise;
+  const authUrl = legacy ? "https://custom.example/auth/" : "https://myfield.one/auth/";
+  const connecting = legacy ? instance.getBucket().connect({ authBase: authUrl, autoSync: false }) : instance.connect({ autoSync: false });
+  const connectResult = connecting.catch(error => error);
+  let cancelled = Promise.resolve();
+  if (result === "revoked-disconnect") instance.on("state", (_state, error) => {
+    if (error?.code === "NOT_AUTHORIZED") cancelled = instance.disconnect();
+  });
+  await tick();
+  const disconnecting = result === "disconnect" ? instance.disconnect() : Promise.resolve();
+  if (result === "dispose") stop(instance);
+  if (result !== "revoked") env.resetHandler();
+  release.resolve();
+  await disconnecting;
+  if (result === "revoked") {
+    assert.equal((await resumeResult).code, "NOT_AUTHORIZED");
+    await until(() => env.opened.length === 2 && env.opened[1].location.href.includes("authRequest"));
+    assert.equal(new URL(env.opened[1].location.href).origin, new URL(authUrl).origin);
+    env.resetHandler();
+    await env.approve();
+    assert.equal(await connectResult, "connected");
+  } else if (result === "success") {
+    assert.equal(await resumeResult, "connected");
+    assert.equal(await connectResult, "connected");
+    assert.equal((await env.data.get(`meta:${env.namespace}:endpoints`)).authBase, authUrl);
+  } else {
+    const error = await resumeResult;
+    assert.equal(error.name === "AbortError" || ["NETWORK_ERROR", "NOT_AUTHORIZED"].includes(error.code), true);
+    const next = await connectResult;
+    if (legacy) assert.equal(next, "disconnected");
+    else assert.equal(result === "network-error" ? next.code : next.name, result === "network-error" ? "NETWORK_ERROR" : "AbortError");
+  }
+  await cancelled;
+  assert.equal(env.opened.length, result === "revoked" ? 2 : 1);
 });
 
 test("an empty legacy authBase preserves the saved authorization address", async t => {

@@ -13,7 +13,7 @@ import type { BucketAccess } from "../auth/types.ts";
 const DEFAULT_AUTH_URL = "https://myfield.one/auth/";
 type ConnectionState = "disconnected" | "connecting" | "connected";
 type StateListener = (state: ConnectionState, error?: ClientError) => void;
-type ConnectionFlow = { controller: AbortController; prompt: boolean; legacy: boolean; authBase?: string;
+type ConnectionFlow = { controller: AbortController; readonly prompt: boolean; legacy: boolean; authBase?: string;
   prepared: Promise<{ authUrl: string; establish(): Promise<ConnectionState> }>; promise: Promise<ConnectionState> };
 
 function notAuthorized(message: string, cause?: unknown): ClientError {
@@ -84,6 +84,7 @@ export function createInstanceConnection(deps: {
   let cleanup: Promise<void> = Promise.resolve();
   let storageQueue: Promise<unknown> = Promise.resolve();
   let keyChanges: Promise<void> = Promise.resolve();
+  let generation = 0;
   let disposed = false;
   const browserAuth = createAuthorizationFlow(deps);
   const { ownCallback, handleCallback, requestAuthorization } = browserAuth;
@@ -307,9 +308,7 @@ export function createInstanceConnection(deps: {
           forceSessionRefresh = false;
           return { token: session.token };
         };
-        const verified = current.prompt || forceSessionRefresh;
-        await getCredential(verified);
-        if (current.prompt && !verified) await getCredential(true);
+        await getCredential(current.prompt || forceSessionRefresh);
         signal.throwIfAborted();
         remoteClient = createRemoteClient({ apiBase, mfid: access.mfid, bucketId: access.bucketId, getCredential, fetch: fetchFor(signal) });
         localAccess = { access, signal, fetch: fetchFor(signal), sessionProvider: {
@@ -434,15 +433,23 @@ export function createInstanceConnection(deps: {
         .then(() => "connected" as const);
     }
     if (flow) {
+      const current = flow;
+      if (prompt && !current.prompt) {
+        const waitingGeneration = generation;
+        return current.promise.catch(error => {
+          if (!(error instanceof ClientError) || error.code !== "NOT_AUTHORIZED") throw error;
+        }).then(() => {
+          if (generation !== waitingGeneration || disposed) throw new DOMException("Connection cancelled", "AbortError");
+          return start(prompt, args, legacy, authBase);
+        });
+      }
       if (authBase !== undefined) {
-        const current = flow, authUrl = authBase;
+        const authUrl = authBase;
         return current.prepared.then(prepared => {
           if (authUrl !== prepared.authUrl) throw new ClientError("INVALID_STATE", "Authorization service cannot change during connection");
-          current.prompt ||= prompt;
           return current.promise;
         }, () => current.promise);
       }
-      flow.prompt ||= prompt;
       return flow.promise;
     }
     const controller = new AbortController();
@@ -472,6 +479,7 @@ export function createInstanceConnection(deps: {
   }
 
   function stop(reason: unknown) {
+    generation++;
     const controller = connectionController;
     connectionController = null;
     remoteClient = null;

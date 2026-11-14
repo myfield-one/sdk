@@ -2,6 +2,7 @@
 
 ## 0.9.2-alpha.1 (unreleased)
 
+- Fix `connect()` racing startup `resume()`, including custom authorization URLs and cancellation.
 - Unify Local and Remote connections, add `instance.getBucket()` and optional auto-sync
   control on connect/resume. Keep manual sync available and validate legacy upload ACKs.
 - Breaking: legacy `bucket.connect({ authBase })` no longer appends `/auth/` or infers
