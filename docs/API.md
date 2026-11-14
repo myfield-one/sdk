@@ -186,15 +186,11 @@ when connect/resume completes, when the connection becomes active, or on
 `setAutoSync(true)`; handle creation alone does no I/O. `connect({ autoSync })` is
 shorthand for `setAutoSync()` followed by connecting.
 
-Bucket resume/connect/disconnect connect that bucket's own resource. They are the entry
-for buckets from `createBucket()`; prefer Instance methods for the default bucket.
-bucket.connect also accepts `authBase` and `autoSync`. The same resource shares its
-connection with Instance/Remote.
-`authBase` is the exact absolute authorization page URL; no `/auth/` path is appended
-and no API host is inferred. The API address comes from the authorization grant; access
-without a usable one is treated as unauthorized and needs reauthorization. Invalid
-calls reject; authorization-flow failures resolve `"disconnected"` and report the error
-through the state event.
+Bucket `resume`/`connect`/`disconnect` manage that bucket's own connection; use them for
+buckets from `createBucket()` and Instance methods for the default bucket.
+`bucket.connect` also accepts `autoSync` and `authBase`, the full authorization page URL.
+Invalid calls reject; authorization failures resolve `"disconnected"` and report the
+error through the state event.
 
 ## Events
 
