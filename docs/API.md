@@ -52,8 +52,7 @@ instance.createBucket(options: { id: string }): Bucket;
 ## Local Object API
 
 Local operations work before `connect()` and never wait for network sync. They
-initialize storage lazily; storage errors surface on first use. `bucket.ready()` is a
-deprecated no-op kept for compatibility.
+initialize storage lazily; storage errors surface on first use.
 
 ```ts
 bucket.put(id: string, object: Record<string, unknown>): Promise<void>;
