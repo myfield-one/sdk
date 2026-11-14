@@ -15,6 +15,22 @@ function makeClient(relay, actorId, overrides = {}) {
   });
 }
 
+test("stopping automatic sync disables timers and write triggers while manual sync remains available", async () => {
+  const relay = createMockRelay(), client = makeClient(relay, "manual");
+  let runs = 0;
+  client.start({ intervalMs: 5, run: async () => { runs++; } });
+  client.stop();
+  const stoppedAt = runs;
+  await client.setFields("note", { text: "manual" });
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(runs, stoppedAt);
+  assert.equal(relay.objects.size, 0);
+  await client.syncObject("note");
+  assert.equal(relay.objects.size, 1);
+  assert.equal((await client.getFields("note")).text, "manual");
+  client.dispose();
+});
+
 test("two clients converge on disjoint field writes", async () => {
   const relay = createMockRelay();
   const a = makeClient(relay, "actor-a");
@@ -243,4 +259,24 @@ test("unchanged head sync does not pull payload", async () => {
   assert.equal(payloadPulls, 1, "first sync needs payload");
   await client.syncObject("doc:1");
   assert.equal(payloadPulls, 1, "unchanged head skips payload");
+});
+
+test("a committed write with a lost acknowledgement converges without another version", async () => {
+  const relay = createMockRelay(), base = relay.transport();
+  let pushes = 0, loseAck = true;
+  const transport = { ...base, async push(...args) {
+    pushes++;
+    const result = await base.push(...args);
+    if (loseAck) { loseAck = false; throw Object.assign(new Error("push returned an unconfirmed acknowledgement: unavailable"), { retryable: true }); }
+    return result;
+  } };
+  const client = makeClient(relay, "lost-ack", { transport });
+  await client.setFields("note", { text: "once" });
+  await assert.rejects(client.syncObject("note"));
+  const committed = relay.objects.get("note").versionId;
+  await client.syncObject("note");
+  assert.equal(pushes, 1);
+  assert.equal(relay.objects.get("note").versionId, committed);
+  assert.equal((await client.getFields("note")).text, "once");
+  client.dispose();
 });

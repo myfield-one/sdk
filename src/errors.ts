@@ -8,6 +8,8 @@ export class NotConnectedError extends Error {
   }
 }
 
+export const REVOKED_AUTHORIZATION_CODES: readonly string[] = ["GRANT_REVOKED", "GRANT_NOT_FOUND", "AUTH_FAILED"];
+
 export type ClientErrorOptions = {
   status?: number;
   requestId?: string;

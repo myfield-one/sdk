@@ -39,6 +39,7 @@ export type Bucket = {
   readonly id: string;
   readonly state: BucketState;
   binary(input: BinaryInput | BucketBinaryValue, options?: BinaryOptions): BucketBinaryValue;
+  /** @deprecated No-op kept for compatibility; operations initialize storage lazily. */
   ready(): Promise<void>;
   put(objectId: string, object: Record<string, unknown>): Promise<void>;
   get(objectId: string): Promise<Record<string, unknown> | null>;
@@ -59,12 +60,13 @@ export type Instance = {
   readonly namespace: string;
   readonly remote: { getBucket(): RemoteBucket };
   readonly state: BucketState;
+  getBucket(): Bucket;
   getKey(): Promise<InstanceKey | null>;
   createKey(): Promise<InstanceKey>;
   importKey(key: InstanceKey): Promise<void>;
   removeKey(): Promise<void>;
-  resume(): Promise<BucketState>;
-  connect(): Promise<BucketState>;
+  resume(options?: { autoSync?: boolean }): Promise<BucketState>;
+  connect(options?: { autoSync?: boolean }): Promise<BucketState>;
   disconnect(): Promise<void>;
   on(event: "state", handler: (state: BucketState, error?: ClientError) => void): () => void;
   createBucket(options: { id: string }): Bucket;

@@ -6,10 +6,11 @@ import { bucketResourceId } from "./identifiers.ts";
 
 const notAuthorized = (message: string, cause?: unknown) => new ClientError("NOT_AUTHORIZED", message, { cause });
 
-export function createAuthorizationFlow(deps: { getAppId(): string; persistent?: boolean }) {
+export function createAuthorizationFlow(deps: { getAppId(): string; getBucketId?(): string; persistent?: boolean }) {
+  const getBucketId = deps.getBucketId ?? deps.getAppId;
   let closeAuthorization = () => {};
   async function ownCallback(url: URL, storage: StorageAdapter): Promise<boolean> {
-    const resourceId = bucketResourceId(deps.getAppId());
+    const resourceId = bucketResourceId(getBucketId());
     const requestId = url.searchParams.get("mf_request_id");
     if (!requestId) return false;
     const keys = authRecordKeys(deps.getAppId());
@@ -47,7 +48,7 @@ export function createAuthorizationFlow(deps: { getAppId(): string; persistent?:
     signal.throwIfAborted();
     const ios = typeof navigator !== "undefined" && (/iPad|iPhone|iPod/.test(navigator.userAgent)
       || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1));
-    const popup = ios ? null : window.open("about:blank", "myfield-sdk-auth", "popup=yes,width=520,height=720");
+    const popup = ios ? null : window.open("about:blank", `myfield-sdk-auth:${getBucketId()}`, "popup=yes,width=520,height=720");
     if (!popup && deps.persistent === false) throw new ClientError("INVALID_STATE", "Redirect authorization requires persistent storage");
     setPopup(popup);
     return new Promise<void>((resolve, reject) => {
@@ -84,7 +85,7 @@ export function createAuthorizationFlow(deps: { getAppId(): string; persistent?:
       if (popup) timer = setInterval(() => {
         if (popup.closed && !processing) finish(notAuthorized("Authorization window closed"));
       }, 250);
-      void auth.authorize({ bucketId: deps.getAppId() }).catch(finish);
+      void auth.authorize({ bucketId: getBucketId() }).catch(finish);
     });
   }
 

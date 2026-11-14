@@ -21,11 +21,11 @@ while keeping compatibility. License: Apache-2.0.
 ```ts
 import { createInstance } from "@myfield/sdk";
 
-const instance = createInstance(); // namespace defaults to "default"
-const bucket = instance.createBucket({ id: "app.example.com" });
+const instance = createInstance("notes.example.com");
+const bucket = instance.getBucket();
 
 // On startup: resume an existing authorization / handle an auth callback.
-await bucket.resume();
+await instance.resume();
 
 // Local-first object CRUD works before authorization.
 await bucket.put("note:1", { title: "hello", body: "world" });
@@ -35,23 +35,22 @@ const entries = await bucket.list({ prefix: "note:" });
 
 // On the user's "Connect" click: run the authorization flow (popup, or
 // same-tab on iOS).
-await bucket.connect(); // defaults to https://myfield.one/auth/
+await instance.connect(); // defaults to https://myfield.one/auth/
 ```
+
+Full API reference: [`docs/API.md`](docs/API.md).
 
 ## Remote object access
 
-Use `createInstance({ appId: "notes.example.com" })`, then `instance.resume()` on startup
-and `instance.connect()` from a user action. `instance.remote.getBucket()` provides
-object reads, CAS commits, version history and change notifications.
-The SDK reuses instance authorization; the app owns payload encryption and local
-storage. Remote connection does not start Local synchronization.
-See [Remote Object API](docs/API.md#remote-object-api).
+`instance.remote.getBucket()` provides object reads, CAS commits, version history and
+change notifications with the instance's authorization; the app owns payload encryption
+and local storage. See [Remote Object API](docs/API.md#remote-object-api).
 
 ## What the SDK handles
 
 - **Auth**: instance keygen, the `https://myfield.one/auth/` authorization
   flow (popup / same-tab), callback decryption, bearer session refresh, and
-  the unauthorized → disconnected transition. Apps see bucket
+  the unauthorized → disconnected transition. Apps use Instance
   `connect()` / `disconnect()` / state events only.
 - **Pairwise identity**: authorization is alias-only. Your app sees an alias
   id for the user, never their global Myfield identity; different apps see
@@ -85,20 +84,6 @@ See [Remote Object API](docs/API.md#remote-object-api).
 - **Freshness, not realtime collaboration**: the pull model targets
   single-user multi-device freshness, not millisecond multi-user
   collaboration or presence.
-
-## Current service status
-
-The Local facade does not expose `apiBase`. The auth service returns
-`resourceApiUrl` in the encrypted callback result, so SDKs do not encode
-deployment host rules. The SDK uses `bucketAccessGrant.resourceId` as the
-remote sync resource id, with `envelope.bucketId` treated as optional
-compatibility metadata.
-
-Deferred service work after this preview release:
-
-- A bucket-scoped hibernatable WebSocket feed under the resource API root.
-  SSE remains compatibility/development-only; SDK fallback is timer
-  sync over the object index and feed.
 
 ## Public entry
 

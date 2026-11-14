@@ -23,8 +23,8 @@ import {
   createNamespacedMemoryStorageAdapter,
   type StorageAdapter,
 } from "./bucket/store.ts";
-import { BucketTransport, OfflineError } from "./bucket/transport.ts";
-import { createInstanceAuthClient, isValidBucketId, type AuthCallbackResult, type InstanceAuthClient } from "./auth/instance.ts";
+import { BucketTransport, BucketTransportError, OfflineError } from "./bucket/transport.ts";
+import { isValidBucketId } from "./auth/identifiers.ts";
 import { ClientError, NotConnectedError } from "./errors.ts";
 import { randomId } from "./internal/encoding.ts";
 import { resolveAppId } from "./auth/identifiers.ts";
@@ -33,8 +33,6 @@ import type { InstanceKey } from "./auth/keys.ts";
 import { createInstanceConnection } from "./remote/connection.ts";
 import type { RemoteBucket } from "./remote/bucket.ts";
 
-const DEFAULT_AUTH_BASE = "https://myfield.one/auth/";
-const DEFAULT_API_BASE = "https://api.myfield.one";
 const INDEX_OBJECT_ID = "~index";
 const ID_FIELD = "~id";
 const DELETED_FIELD = "~deleted";
@@ -61,6 +59,7 @@ export type Bucket = {
   readonly id: string;
   readonly state: BucketState;
   binary(input: BinaryInput | BucketBinaryValue, options?: BinaryOptions): BucketBinaryValue;
+  /** @deprecated No-op kept for compatibility; operations initialize storage lazily. */
   ready(): Promise<void>;
   put(objectId: string, object: Record<string, unknown>): Promise<void>;
   get(objectId: string): Promise<Record<string, unknown> | null>;
@@ -84,12 +83,13 @@ export type Instance = {
   readonly namespace: string;
   readonly remote: { getBucket(): RemoteBucket };
   readonly state: BucketState;
+  getBucket(): Bucket;
   getKey(): Promise<InstanceKey | null>;
   createKey(): Promise<InstanceKey>;
   importKey(key: InstanceKey): Promise<void>;
   removeKey(): Promise<void>;
-  resume(): Promise<BucketState>;
-  connect(): Promise<BucketState>;
+  resume(options?: { autoSync?: boolean }): Promise<BucketState>;
+  connect(options?: { autoSync?: boolean }): Promise<BucketState>;
   disconnect(): Promise<void>;
   on(event: "state", handler: (state: BucketState, error?: ClientError) => void): () => void;
   createBucket(options: { id: string }): Bucket;
@@ -117,43 +117,76 @@ export function createInstance(input: string | CreateInstanceOptions = {}, ...ex
       : createIndexedDbStorageAdapter({ dbName: `myfield-sdk:${namespace}` });
   const authAdapter = prefixedAdapter(baseAdapter, "auth:");
 
-  // One handle per bucket id: separate facades over the same storage would
-  // split event listeners and duplicate clients/clocks/debounce timers.
-  const buckets = new Map<string, Bucket>();
-  const connection = createInstanceConnection({ getAppId, data: baseAdapter, auth: authAdapter,
-    hasLegacyBucket: () => { try { return buckets.has(getAppId()); } catch { return false; } },
-    hasActiveLocalConnection: () => [...buckets.values()].some(bucket => bucket.state !== "disconnected"),
-    persistent: storageKind !== "memory" });
+  const buckets = new Map<string, ReturnType<typeof createBucketFacade>>();
+  const connections = new Map<string, ReturnType<typeof createInstanceConnection>>();
+  const connectionDeps = { getAppId, data: baseAdapter, auth: authAdapter,
+    hasActiveConnection: () => connection.active || [...connections.values()].some(value => value.active),
+    persistent: storageKind !== "memory" };
+  const connection = createInstanceConnection(connectionDeps);
   let disposed = false;
+
+  function getLocalBucket(bucketId: string) {
+    if (disposed) throw new ClientError("INVALID_STATE", "Instance runtime has stopped");
+    const existing = buckets.get(bucketId);
+    if (existing) return existing;
+    let isDefault = false;
+    try { isDefault = bucketId === getAppId(); } catch {}
+    let resource = isDefault ? connection : connections.get(bucketId);
+    if (!resource) {
+      resource = createInstanceConnection({ ...connectionDeps, getBucketId: () => bucketId });
+      connections.set(bucketId, resource);
+    }
+    const owned = resource;
+    const runtime = createBucketFacade({ bucketId, dataAdapter: baseAdapter, connection: owned, onDispose: () => {
+      if (buckets.get(bucketId) === runtime) buckets.delete(bucketId);
+      if (owned !== connection && connections.get(bucketId) === owned) {
+        connections.delete(bucketId);
+        owned.dispose();
+      }
+    } });
+    buckets.set(bucketId, runtime);
+    return runtime;
+  }
+
+  function startLocal(prompt: boolean, args: unknown[]): Promise<BucketState> {
+    try {
+      if (args.length > 1) throw new ClientError("INVALID_INPUT", "Connection accepts one options object");
+      const options = args[0];
+      if (options !== undefined && (!options || typeof options !== "object" || Array.isArray(options)
+        || Object.keys(options).some(key => key !== "autoSync")
+        || ("autoSync" in options && options.autoSync !== undefined && typeof options.autoSync !== "boolean"))) {
+        throw new ClientError("INVALID_INPUT", "Only autoSync is supported");
+      }
+      const runtime = getLocalBucket(getAppId());
+      return runtime.connectInstance(prompt, (options as { autoSync?: boolean } | undefined)?.autoSync);
+    } catch (error) { return Promise.reject(error); }
+  }
 
   const instance: Instance = {
     namespace,
     remote: connection.remote,
     get state() { return connection.state; },
-    resume: connection.resume,
+    getBucket: () => getLocalBucket(getAppId()).bucket,
+    resume: (...args: unknown[]) => startLocal(false, args),
     on: connection.on,
-    connect: connection.connect,
+    connect: (...args: unknown[]) => startLocal(true, args),
     getKey: connection.getKey,
     createKey: connection.createKey,
     importKey: connection.importKey,
     removeKey: connection.removeKey,
     disconnect: connection.disconnect,
     createBucket(bucketOptions) {
-      if (disposed) throw new ClientError("DISPOSED", "Instance has been disposed");
       const bucketId = String(bucketOptions?.id || "").trim();
       if (!bucketId) throw new Error("bucket id is required");
       if (!isValidBucketId(bucketId)) throw new Error("invalid bucketId");
-      const existing = buckets.get(bucketId);
-      if (existing) return existing;
-      const bucket = createBucketFacade({ namespace, bucketId, dataAdapter: baseAdapter, authAdapter, getAppId });
-      buckets.set(bucketId, bucket);
-      try { if (bucketId === getAppId()) connection.block(); } catch {}
-      return bucket;
+      return getLocalBucket(bucketId).bucket;
     },
   };
+  if (explicitAppId) getLocalBucket(explicitAppId);
   instanceTestCleanup.set(instance, () => {
     disposed = true;
-    for (const bucket of buckets.values()) bucket.dispose();
+    for (const runtime of buckets.values()) runtime.bucket.dispose();
+    for (const resource of connections.values()) resource.dispose();
     connection.dispose();
   });
   return instance;
@@ -162,19 +195,17 @@ export function createInstance(input: string | CreateInstanceOptions = {}, ...ex
 // ---------------------------------------------------------------------------
 
 type BucketDeps = {
-  namespace: string;
   bucketId: string;
   dataAdapter: StorageAdapter;
-  authAdapter: StorageAdapter;
-  getAppId(): string;
+  connection: ReturnType<typeof createInstanceConnection>;
+  onDispose?: () => void;
 };
 
-function createBucketFacade(deps: BucketDeps): Bucket {
-  const { bucketId, dataAdapter, authAdapter } = deps;
-  const endpointsKey = `meta:${bucketId}:endpoints`;
+function createBucketFacade(deps: BucketDeps) {
+  const { bucketId, dataAdapter, connection } = deps;
   const actorKey = `meta:actor`;
 
-  let state: BucketState = "disconnected";
+  let state: BucketState = connection.state;
   let client: BucketClient | null = null;
   let clientInit: Promise<BucketClient> | null = null;
   let liveTransport: BucketTransportLike | null = null;
@@ -183,15 +214,11 @@ function createBucketFacade(deps: BucketDeps): Bucket {
   let syncIntervalMs: number | undefined;
   let disposed = false;
 
-  // Browser auth machinery (lazy; never touched by the test seam path).
-  let authClient: InstanceAuthClient | null = null;
-  let popupAuthClient: InstanceAuthClient | null = null;
-  let authPageOrigin = "";
-  let authPopupWindow: Window | null = null;
-  let authPopupPollTimer: ReturnType<typeof setInterval> | null = null;
-  let pendingConnect: { resolve: (state: BucketState) => void } | null = null;
-  let pendingConnectDone: Promise<BucketState> | null = null;
-  let popupMessageListener: ((event: MessageEvent<unknown>) => void) | null = null;
+  let connectedAccess: ReturnType<typeof connection.getLocalAccess> | null = null;
+  let activating: Promise<void> | null = null;
+  let verifiedAccess: ReturnType<typeof connection.getLocalAccess> | null = null;
+  let connecting: { operation: Promise<BucketState>; result: Promise<BucketState> } | null = null;
+  let lastFailure: unknown = null;
 
   const listeners = { state: new Set<(s: BucketState, d?: string) => void>(), change: new Set<(id: string) => void>() };
 
@@ -207,13 +234,6 @@ function createBucketFacade(deps: BucketDeps): Bucket {
   function emitChange(objectId: string): void {
     if (objectId.startsWith(RESERVED_PREFIX)) return;
     for (const handler of listeners.change) handler(objectId);
-  }
-
-  function settlePendingConnect(): void {
-    if (!pendingConnect) return;
-    const settle = pendingConnect;
-    pendingConnect = null;
-    settle.resolve(state);
   }
 
   function ensureClient(): Promise<BucketClient> {
@@ -244,6 +264,7 @@ function createBucketFacade(deps: BucketDeps): Bucket {
           },
         },
         storage: dataAdapter,
+        autoSync: autoSync && Boolean(liveTransport),
         actorId,
         localOnlyObjectIds: [INDEX_OBJECT_ID],
         validateRemote: assertRemoteObjectId,
@@ -257,7 +278,9 @@ function createBucketFacade(deps: BucketDeps): Bucket {
           if (error instanceof OfflineError) return;
           // Retryable sync failures surface as state detail without a state
           // change; local data is never affected.
-          emitState(state, `sync error${objectId ? ` (${objectId})` : ""}: ${formatError(error)}`);
+          const detail = `sync error${objectId ? ` (${objectId})` : ""}: ${formatError(error)}`;
+          if (connection.state === "connected") connection.report(localError(error, detail));
+          else emitState(state, detail);
         },
       });
       return client;
@@ -474,191 +497,115 @@ function createBucketFacade(deps: BucketDeps): Bucket {
     client.start({ run: runSyncPass, ...(syncIntervalMs !== undefined ? { intervalMs: syncIntervalMs } : {}) });
   }
 
-  // ---- connection (browser) ----------------------------------------------
-
-  async function readStoredEndpoints(): Promise<{ authBase: string; apiBase: string }> {
-    const stored = await dataAdapter.get<{ authBase?: string; apiBase?: string }>(endpointsKey);
-    const authBase = stored?.authBase || DEFAULT_AUTH_BASE;
-    return {
-      authBase,
-      apiBase: stored?.apiBase || apiBaseForAuthBase(authBase),
-    };
+  function bindTransport() {
+    const current = connection.getLocalAccess();
+    if (current === connectedAccess) return current;
+    connectedAccess = current;
+    liveTransport = new BucketTransport({ apiBase: current.access.resourceApiUrl!,
+      mfid: current.access.mfid, keys: current.access.keys,
+      sessionProvider: current.sessionProvider, fetch: current.fetch });
+    liveWireId = current.access.keys.wireObjectId;
+    return current;
   }
 
-  async function ensureAuthClients(endpoints: { authBase: string; apiBase: string }): Promise<InstanceAuthClient> {
-    if (authClient) return authClient;
-    if (typeof window === "undefined") throw new Error("connect()/resume() require a browser environment");
-    const origin = window.location.origin;
-    const authPageUrl = normalizeAuthBase(endpoints.authBase);
-    authPageOrigin = new URL(authPageUrl, window.location.href).origin;
-    const baseOptions = {
-      appId: deps.getAppId(),
-      apiBase: endpoints.apiBase,
-      redirectUri: origin + window.location.pathname,
-      origin,
-      storage: authAdapter,
-    };
-    authClient = createInstanceAuthClient({
-      ...baseOptions,
-      authPageUrl: addCallbackTransport(authPageUrl, "same-tab"),
-    });
-    popupAuthClient = createInstanceAuthClient({
-      ...baseOptions,
-      authPageUrl: addCallbackTransport(authPageUrl, "popup"),
-      openAuthUrl: (url) => openAuthPopupUrl(url),
-    });
-    popupMessageListener = (event: MessageEvent<unknown>) => void onPopupMessage(event);
-    window.addEventListener("message", popupMessageListener);
-    return authClient;
+  function stopLocal() {
+    liveTransport = null;
+    liveWireId = null;
+    connectedAccess = null;
+    verifiedAccess = null;
+    activating = null;
+    client?.stop();
   }
 
-  function clearPopupMonitor(): void {
-    if (authPopupPollTimer != null) {
-      clearInterval(authPopupPollTimer);
-      authPopupPollTimer = null;
-    }
-  }
+  let connectionState = connection.state;
+  const stopState = connection.on("state", (next, error) => {
+    if (disposed) return;
+    const entered = next === "connected" && connectionState !== "connected";
+    connectionState = next;
+    if (next === "disconnected" && error) lastFailure = error;
+    if (next === "connected") bindTransport(); else stopLocal();
+    emitState(next, error ? formatError(error) : undefined);
+    // Error reports re-emit "connected"; only a new connection starts sync.
+    if (entered) void reconcile().catch(() => {});
+  });
+  if (state === "connected") bindTransport();
 
-  function tryOpenPopupShell(): boolean {
-    clearPopupMonitor();
-    authPopupWindow?.close();
-    const width = 520;
-    const height = 720;
-    const left = Math.max(0, Math.floor(window.screenX + (window.outerWidth - width) / 2));
-    const top = Math.max(0, Math.floor(window.screenY + (window.outerHeight - height) / 2));
-    authPopupWindow = window.open(
-      "about:blank",
-      "myfield-sdk-auth",
-      `popup=yes,width=${width},height=${height},left=${left},top=${top},resizable=yes,scrollbars=yes`
-    );
-    if (!authPopupWindow || authPopupWindow.closed) {
-      authPopupWindow = null;
-      return false;
-    }
-    try {
-      authPopupWindow.document.title = "Opening Myfield...";
-      authPopupWindow.document.body.textContent = "Opening Myfield authorization...";
-    } catch {
-      // Same-origin about:blank in normal browsers; ignore if blocked.
-    }
-    authPopupWindow.focus();
-    authPopupPollTimer = setInterval(() => {
-      if (!authPopupWindow?.closed) return;
-      clearPopupMonitor();
-      if (state === "connecting") {
-        emitState("disconnected", "authorization window closed");
-        settlePendingConnect();
-      }
-    }, 500);
-    return true;
-  }
-
-  function openAuthPopupUrl(url: string): void {
-    if (!authPopupWindow || authPopupWindow.closed) {
-      if (!tryOpenPopupShell()) throw new Error("authorization popup was blocked");
-    }
-    try {
-      authPopupWindow!.location.href = url;
-      authPopupWindow!.focus();
-    } catch {
-      authPopupWindow = window.open(url, "myfield-sdk-auth");
-      if (!authPopupWindow) throw new Error("authorization popup was blocked");
-    }
-  }
-
-  async function onPopupMessage(event: MessageEvent<unknown>): Promise<void> {
-    if (event.origin !== authPageOrigin) return;
-    const message = event.data as { type?: unknown; callbackUrl?: unknown } | null;
-    if (!message || message.type !== "myfield.auth.callback" || typeof message.callbackUrl !== "string") return;
-    clearPopupMonitor();
-    authPopupWindow?.close();
-    authPopupWindow = null;
-    await handleCallbackUrl(message.callbackUrl);
-  }
-
-  async function handleCallbackUrl(callbackUrl: string): Promise<AuthCallbackResult | null> {
-    try {
-      const auth = await ensureAuthClients(await readStoredEndpoints());
-      const callback = await auth.handleCallback(callbackUrl);
-      if (!callback) return null;
-      if (callback.result === "approved") {
-        await establish({ forceRefresh: true });
-      } else {
-        emitState("disconnected", callback.errorDescription || callback.error || callback.result);
-        settlePendingConnect();
-      }
-      return callback;
-    } catch (error) {
-      emitState("disconnected", formatError(error));
-      settlePendingConnect();
-      return null;
-    }
-  }
-
-  async function establish(sessionOptions: { forceRefresh?: boolean } = {}): Promise<void> {
-    emitState("connecting");
-    try {
-      const endpoints = await readStoredEndpoints();
-      const auth = await ensureAuthClients(endpoints);
-      const c = await ensureClient();
-      await auth.getSession(bucketId, sessionOptions);
-      const access = await auth.getBucketAccess(bucketId);
-      if (!access.resourceApiUrl) throw new Error("auth callback missing resourceApiUrl; reconnect through the current Myfield auth page");
-      const transport = new BucketTransport({
-        apiBase: access.resourceApiUrl,
-        mfid: access.mfid,
-        keys: access.keys,
-        sessionProvider: {
-          getSession: (sessionOpts) => auth.getSession(bucketId, sessionOpts),
-          onUnauthorized: () => {
-            // Grant revoked: drop back to local-first; reconnecting needs a
-            // user gesture through connect() again.
-            liveTransport = null;
-            liveWireId = null;
-            c.stop();
-            emitState("disconnected", "unauthorized");
-          },
-        },
-      });
-      await verifyConnectedTransport(transport, access.keys.wireObjectId);
-      liveTransport = transport;
-      liveWireId = access.keys.wireObjectId;
+  function activate(): Promise<void> {
+    const current = bindTransport();
+    if (verifiedAccess === current) {
       startAutoSync();
-      emitState("connected");
-    } catch (error) {
-      client?.stop();
-      emitState("disconnected", formatError(error));
-    } finally {
-      settlePendingConnect();
+      return Promise.resolve();
     }
+    if (activating) return activating;
+    const operation = (async () => {
+      const transport = liveTransport!;
+      await ensureClient();
+      current.signal.throwIfAborted();
+      await transport.pullHead(await current.access.keys.wireObjectId(INDEX_OBJECT_ID));
+      current.signal.throwIfAborted();
+      if (disposed) return;
+      verifiedAccess = current;
+      startAutoSync();
+    })().catch(async error => {
+      current.signal.throwIfAborted();
+      if (disposed) return;
+      const failure = localError(error);
+      if (failure.retryable) {
+        // Keep shared access; automatic sync retries and reports later failures.
+        connection.report(failure);
+        startAutoSync();
+        return;
+      }
+      await connection.fail(failure, current.signal);
+      throw failure;
+    }).finally(() => { if (activating === operation) activating = null; });
+    activating = operation;
+    return operation;
   }
 
-  async function verifyConnectedTransport(transport: BucketTransport, wireObjectId: (appObjectId: string) => Promise<string>): Promise<void> {
-    await transport.pullHead(await wireObjectId(INDEX_OBJECT_ID));
+  // Automatic sync runs exactly while the connection is up and autoSync is on.
+  function reconcile(): Promise<void> {
+    if (disposed) return Promise.resolve();
+    if (!autoSync || !liveTransport) { client?.stop(); return Promise.resolve(); }
+    return activate();
   }
 
-  async function handleStartupCallback(): Promise<boolean> {
-    const href = window.location.href;
-    if (!href.includes("mf_auth_result") && !new URL(href).searchParams.get("mf_request_id")) return false;
-    const callback = await handleCallbackUrl(href);
-    if (callback) stripCallbackFromUrl();
-    return !!callback;
+  function connectInstance(prompt: boolean, enabled?: boolean): Promise<BucketState> {
+    if (enabled !== undefined) bucket.setAutoSync(enabled);
+    const operation = prompt ? connection.connect() : connection.resume();
+    if (connecting?.operation === operation) return connecting.result;
+    const done = operation.then(async next => {
+      if (next === "connected") await reconcile();
+      return next;
+    }).finally(() => { if (connecting?.result === done) connecting = null; });
+    connecting = { operation, result: done };
+    return done;
   }
 
-  function stripCallbackFromUrl(): void {
+  // 0.9.1 semantics: invalid calls reject; authorization-flow failures resolve
+  // "disconnected" after the state event carries the error.
+  async function connectLegacy(prompt: boolean, authBase?: string): Promise<BucketState> {
+    if (disposed) throw new Error("disposed");
+    await ensureClient();
+    if (typeof window === "undefined") {
+      if (!prompt) return state;
+      throw new ClientError("INVALID_STATE", "Connecting requires a browser");
+    }
+    let next: BucketState;
     try {
-      const url = new URL(window.location.href);
-      url.hash = "";
-      for (const param of ["state", "error", "error_description", "error_uri", "mf_request_id", "mf_result"]) url.searchParams.delete(param);
-      window.history.replaceState(null, "", url.toString());
-    } catch {
-      // Cosmetic only.
+      next = await (prompt ? connection.connectLegacy(authBase) : connection.resumeLegacy());
+    } catch (error) {
+      if (error === lastFailure || isAbortError(error)) return "disconnected";
+      throw error;
     }
+    if (next !== "connected") return next;
+    try { await reconcile(); } catch { return "disconnected"; }
+    return next;
   }
 
   // ---- public object ------------------------------------------------------
 
-  return {
+  const bucket: Bucket = {
     id: bucketId,
     get state() {
       return state;
@@ -666,92 +613,24 @@ function createBucketFacade(deps: BucketDeps): Bucket {
     binary(input, options) {
       return createBucketBinaryValue(input, options);
     },
-    async ready() {
-      await ensureClient();
-    },
+    async ready() {},
     put,
     get: getObject,
     update,
     delete: deleteObject,
     list,
-    async resume() {
-      if (disposed) throw new Error("disposed");
-      await ensureClient();
-      if (typeof window === "undefined") return state;
-      if (state !== "disconnected") return state;
-      const auth = await ensureAuthClients(await readStoredEndpoints());
-      if (await handleStartupCallback()) return state;
-      const context = await auth.getContext(bucketId);
-      if (context) await establish();
-      return state;
+    resume: () => connectLegacy(false),
+    connect(options) {
+      if (options?.autoSync !== undefined) this.setAutoSync(options.autoSync);
+      return connectLegacy(true, options?.authBase || undefined);
     },
-    async connect(options) {
-      if (disposed) throw new Error("disposed");
-      if (options?.autoSync !== undefined) autoSync = options.autoSync;
-      if (options?.authBase) {
-        const endpoints = await readStoredEndpoints();
-        const authBase = normalizeAuthBase(options.authBase);
-        await dataAdapter.set(endpointsKey, {
-          authBase,
-          apiBase: apiBaseForAuthBase(authBase) || endpoints.apiBase,
-        });
-        // Endpoints changed: force fresh auth clients bound to them.
-        if (popupMessageListener && typeof window !== "undefined") {
-          window.removeEventListener("message", popupMessageListener);
-          popupMessageListener = null;
-        }
-        authClient = null;
-        popupAuthClient = null;
-      }
-      if (state === "connected") return state;
-      // Re-entrant connect (e.g. a double-clicked button) joins the pending
-      // flow instead of orphaning the first caller's promise.
-      if (pendingConnectDone) return pendingConnectDone;
-      const resumed = await this.resume();
-      if (resumed !== "disconnected") return resumed;
-      if (pendingConnectDone) return pendingConnectDone;
-      const auth = await ensureAuthClients(await readStoredEndpoints());
-      emitState("connecting");
-      const done = new Promise<BucketState>((resolve) => {
-        pendingConnect = { resolve };
-      }).finally(() => {
-        if (pendingConnectDone === done) pendingConnectDone = null;
-      });
-      pendingConnectDone = done;
-      try {
-        if (shouldUseSameTabAuth() || !tryOpenPopupShell()) {
-          clearPopupMonitor();
-          authPopupWindow = null;
-          await auth.authorize({ bucketId });
-          // Same-tab navigates away; resolution happens on reload via resume().
-        } else {
-          await popupAuthClient!.authorize({ bucketId });
-        }
-      } catch (error) {
-        authPopupWindow?.close();
-        authPopupWindow = null;
-        clearPopupMonitor();
-        emitState("disconnected", formatError(error));
-        settlePendingConnect();
-      }
-      return done;
-    },
-    async disconnect() {
-      liveTransport = null;
-      liveWireId = null;
-      client?.stop();
-      if (authClient) await authClient.clearContext(bucketId);
-      emitState("disconnected");
-      settlePendingConnect();
-    },
+    disconnect: () => connection.disconnect(),
     async sync() {
       await sync();
     },
     setAutoSync(enabled) {
       autoSync = enabled;
-      if (!client) return;
-      if (enabled && liveTransport) startAutoSync();
-      if (!enabled) client.stop();
+      void reconcile().catch(() => {});
     },
     on(event: "state" | "change", handler: (...args: never[]) => void): () => void {
       const set = listeners[event] as Set<(...args: unknown[]) => void>;
@@ -759,10 +638,12 @@ function createBucketFacade(deps: BucketDeps): Bucket {
       return () => set.delete(handler as (...args: unknown[]) => void);
     },
     dispose() {
+      if (disposed) return;
       disposed = true;
       client?.dispose();
-      clearPopupMonitor();
-      if (popupMessageListener && typeof window !== "undefined") window.removeEventListener("message", popupMessageListener);
+      stopState();
+      stopLocal();
+      deps.onDispose?.();
     },
     __bindTestTransport(transport) {
       liveTransport = transport;
@@ -770,6 +651,7 @@ function createBucketFacade(deps: BucketDeps): Bucket {
       emitState("connected");
     },
   };
+  return { bucket, connectInstance };
 }
 
 function normalizeNamespace(value: string | undefined): string {
@@ -792,36 +674,22 @@ function prefixedAdapter(adapter: StorageAdapter, prefix: string): StorageAdapte
   };
 }
 
-function addCallbackTransport(url: string, transport: "same-tab" | "popup"): string {
-  const parsed = new URL(url, typeof window === "undefined" ? "https://localhost/" : window.location.href);
-  parsed.searchParams.set("callbackTransport", transport);
-  return parsed.toString();
-}
-
-function normalizeAuthBase(value: string): string {
-  const parsed = new URL(String(value || DEFAULT_AUTH_BASE), typeof window === "undefined" ? DEFAULT_AUTH_BASE : window.location.href);
-  const pathname = parsed.pathname.replace(/\/+$/, "");
-  parsed.pathname = pathname.endsWith("/auth") ? `${pathname}/` : `${pathname}/auth/`;
-  parsed.search = "";
-  parsed.hash = "";
-  return parsed.toString();
-}
-
-function apiBaseForAuthBase(authBase: string): string {
-  const parsed = new URL(authBase);
-  if (parsed.hostname === "myfield.one") return DEFAULT_API_BASE;
-  if (parsed.hostname === "dev.myfield.space") return "https://api-dev.myfield.space";
-  if (parsed.hostname === "staging.myfield.space") return "https://api-staging.myfield.space";
-  return `${parsed.protocol}//api.${parsed.host}`;
-}
-
-function shouldUseSameTabAuth(): boolean {
-  if (typeof navigator === "undefined") return false;
-  const platform = navigator.platform || "";
-  const userAgent = navigator.userAgent || "";
-  return /iPad|iPhone|iPod/.test(userAgent) || (platform === "MacIntel" && navigator.maxTouchPoints > 1);
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
 }
 
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function localError(error: unknown, message = formatError(error)): ClientError {
+  if (error instanceof ClientError) {
+    if (message === error.message) return error;
+    return new ClientError(error.code, message, { cause: error, retryable: error.retryable, status: error.status,
+      requestId: error.requestId, retryAfterMs: error.retryAfterMs, maxBytes: error.maxBytes });
+  }
+  const retryable = error instanceof BucketTransportError ? error.retryable : error instanceof TypeError;
+  return new ClientError(retryable ? "NETWORK_ERROR" : "SYNC_FAILED", message, {
+    cause: error, retryable, status: error instanceof BucketTransportError ? error.status : undefined,
+  });
 }

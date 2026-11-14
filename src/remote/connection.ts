@@ -4,15 +4,17 @@ import { unwrapBucketKeys } from "../bucket/keys.ts";
 import { toInstanceKey, validateInstanceKey, type InstanceKey } from "../auth/keys.ts";
 import { createInstanceKeyStore, authRecordKeys } from "../auth/store.ts";
 import type { StorageAdapter } from "../bucket/store.ts";
-import { ClientError } from "../errors.ts";
+import { ClientError, REVOKED_AUTHORIZATION_CODES } from "../errors.ts";
 import { createHttpRequest } from "./http.ts";
 import { createRemoteClient, type RemoteClient } from "./client.ts";
 import type { RemoteBucket, FeedHint } from "./bucket.ts";
+import type { BucketAccess } from "../auth/types.ts";
 
 const DEFAULT_AUTH_URL = "https://myfield.one/auth/";
 type ConnectionState = "disconnected" | "connecting" | "connected";
 type StateListener = (state: ConnectionState, error?: ClientError) => void;
-type ConnectionFlow = { controller: AbortController; prompt: boolean; promise: Promise<ConnectionState> };
+type ConnectionFlow = { controller: AbortController; prompt: boolean; legacy: boolean; authBase?: string;
+  prepared: Promise<{ authUrl: string; establish(): Promise<ConnectionState> }>; promise: Promise<ConnectionState> };
 
 function notAuthorized(message: string, cause?: unknown): ClientError {
   return new ClientError("NOT_AUTHORIZED", message, {
@@ -23,7 +25,7 @@ function notAuthorized(message: string, cause?: unknown): ClientError {
 
 function isAuthorizationError(error: ClientError): boolean {
   return (error.code === "NOT_AUTHORIZED" || error.status === 401
-    || error.status === 403 && ["GRANT_REVOKED", "GRANT_NOT_FOUND", "AUTH_FAILED"].includes(error.code));
+    || error.status === 403 && REVOKED_AUTHORIZATION_CODES.includes(error.code));
 }
 
 function connectionError(error: unknown): ClientError {
@@ -62,15 +64,17 @@ function apiOrigin(value: string): string {
 
 export function createInstanceConnection(deps: {
   getAppId(): string;
+  getBucketId?(): string;
   data: StorageAdapter;
   auth: StorageAdapter;
-  hasLegacyBucket(): boolean;
-  hasActiveLocalConnection?(): boolean;
+  hasActiveConnection?(): boolean;
   persistent?: boolean;
 }) {
   let bucketId: string, resourceId: string, endpointsKey: string;
   const storageAppId = deps.getAppId;
   let remoteClient: RemoteClient | null = null;
+  let localAccess: { access: BucketAccess; signal: AbortSignal; fetch: typeof fetch;
+    sessionProvider: { getSession(options?: { forceRefresh?: boolean }): ReturnType<InstanceAuthClient["getSession"]>; onUnauthorized(): Promise<void> } } | null = null;
   let connectionController: AbortController | null = null;
   let flow: ConnectionFlow | null = null;
   let state: ConnectionState = "disconnected";
@@ -86,18 +90,17 @@ export function createInstanceConnection(deps: {
 
   function assertRuntime() {
     if (disposed) throw new ClientError("INVALID_STATE", "Instance runtime has stopped");
-    if (deps.hasLegacyBucket()) throw new ClientError("INVALID_STATE", "Use a separate Instance for Remote access when the same-named Local bucket exists");
   }
 
   function assertUsable() {
     assertRuntime();
-    bucketId = storageAppId();
+    bucketId = deps.getBucketId?.() ?? storageAppId();
     resourceId = `urn:myfield:bucket:${bucketId}`;
-    endpointsKey = authRecordKeys(bucketId).endpoints(bucketId);
+    endpointsKey = authRecordKeys(storageAppId()).endpoints(bucketId);
   }
 
   function assertKeyMutable() {
-    if (disposed || remoteClient || flow || deps.hasActiveLocalConnection?.()) {
+    if (disposed || remoteClient || flow || deps.hasActiveConnection?.()) {
       throw new ClientError("INVALID_STATE", "Disconnect before changing an instance key");
     }
     storageAppId();
@@ -236,6 +239,7 @@ export function createInstanceConnection(deps: {
   function invalidate(controller: AbortController, error: ClientError) {
     if (connectionController !== controller) return cleanup;
     remoteClient = null;
+    localAccess = null;
     connectionController = null;
     forceSessionRefresh = true;
     cleanup = cleanup.catch(() => {}).then(() => storageQueue).then(() => clearAccess(false));
@@ -244,16 +248,20 @@ export function createInstanceConnection(deps: {
     return cleanup;
   }
 
-  async function establish(current: ConnectionFlow): Promise<ConnectionState> {
+  async function prepare(current: ConnectionFlow) {
     const controller = current.controller;
     const signal = controller.signal;
     signal.throwIfAborted();
     if (typeof window === "undefined") throw new ClientError("INVALID_STATE", "Connecting requires a browser");
-    const stored = await deps.data.get<{ authBase?: string }>(endpointsKey);
+    let stored = await deps.data.get<{ authBase?: string; apiBase?: string }>(endpointsKey);
+    if (current.authBase !== undefined) {
+      stored = { authBase: current.authBase };
+      await queue(signal, () => deps.data.set(endpointsKey, stored));
+    }
     signal.throwIfAborted();
     const storage = guardedStorage(signal, storageAppId());
     let authorizationPopup: Window | null = null;
-    let authUrl = DEFAULT_AUTH_URL;
+    let authUrl = current.legacy ? normalizeAuthUrl(stored?.authBase || DEFAULT_AUTH_URL) : DEFAULT_AUTH_URL;
     const makeAuth = (apiBase?: string) => createInstanceAuthClient({
       appId: storageAppId(), apiBase, storage,
       fetchImpl: apiBase ? (input, init) => {
@@ -274,64 +282,76 @@ export function createInstanceConnection(deps: {
     let auth = makeAuth();
     let context = await auth.getContext(bucketId);
     if (context) authUrl = normalizeAuthUrl(stored?.authBase || DEFAULT_AUTH_URL);
-
-    const publish = async (next: InstanceAuthContext, approved: boolean) => {
-      signal.throwIfAborted();
-      emitState("connecting");
-      const apiBase = apiOrigin(next.resourceApiUrl || "");
-      if (approved) await queue(signal, () => deps.data.set(endpointsKey, { authBase: authUrl, apiBase }));
-      auth = makeAuth(apiBase);
-      let access;
-      try { access = await auth.getBucketAccess(bucketId); }
-      catch (error) { signal.throwIfAborted(); throw notAuthorized("Bucket authorization is unusable", error); }
-      if (access.resourceId !== `urn:myfield:bucket:${access.bucketId}`) throw notAuthorized("Grant and bucket key identify different resources");
-      const getCredential = async () => {
+    return { authUrl, establish: async (): Promise<ConnectionState> => {
+      const publish = async (next: InstanceAuthContext, approved: boolean) => {
         signal.throwIfAborted();
-        let session;
-        try { session = await auth.getSession(bucketId, { forceRefresh: forceSessionRefresh }); }
-        catch (error) {
-          signal.throwIfAborted();
-          if (error instanceof ClientError) throw connectionError(error);
-          throw notAuthorized("Session response is unusable", error);
-        }
-        signal.throwIfAborted();
-        if (!session || session.carrier !== "bearer" || typeof session.token !== "string" || !session.token) throw notAuthorized("A bearer session is required");
-        forceSessionRefresh = false;
-        return { token: session.token };
-      };
-      await getCredential();
-      signal.throwIfAborted();
-      remoteClient = createRemoteClient({ apiBase, mfid: access.mfid, bucketId: access.bucketId, getCredential, fetch: fetchFor(signal) });
-      emitState("connected");
-      signal.throwIfAborted();
-      return state;
-    };
-
-    try {
-      const pageUrl = new URL(window.location.href);
-      let approved = false;
-      if (await ownCallback(pageUrl, storage)) {
         emitState("connecting");
-        await handleCallback(auth, pageUrl, signal, true);
-        approved = true;
-        context = await auth.getContext(bucketId);
+        const apiBase = apiOrigin(next.resourceApiUrl || "");
+        if (approved) await queue(signal, () => deps.data.set(endpointsKey, { authBase: authUrl, apiBase }));
+        auth = makeAuth(apiBase);
+        let access;
+        try { access = await auth.getBucketAccess(bucketId); }
+        catch (error) { signal.throwIfAborted(); throw notAuthorized("Bucket authorization is unusable", error); }
+        if (access.resourceId !== `urn:myfield:bucket:${access.bucketId}`) throw notAuthorized("Grant and bucket key identify different resources");
+        const getCredential = async (forceRefresh = forceSessionRefresh) => {
+          signal.throwIfAborted();
+          let session;
+          try { session = await auth.getSession(bucketId, { forceRefresh }); }
+          catch (error) {
+            signal.throwIfAborted();
+            if (error instanceof ClientError) throw connectionError(error);
+            throw notAuthorized("Session response is unusable", error);
+          }
+          signal.throwIfAborted();
+          if (!session || session.carrier !== "bearer" || typeof session.token !== "string" || !session.token) throw notAuthorized("A bearer session is required");
+          forceSessionRefresh = false;
+          return { token: session.token };
+        };
+        const verified = current.prompt || forceSessionRefresh;
+        await getCredential(verified);
+        if (current.prompt && !verified) await getCredential(true);
+        signal.throwIfAborted();
+        remoteClient = createRemoteClient({ apiBase, mfid: access.mfid, bucketId: access.bucketId, getCredential, fetch: fetchFor(signal) });
+        localAccess = { access, signal, fetch: fetchFor(signal), sessionProvider: {
+          getSession: options => handleOperation(controller, async () => {
+            signal.throwIfAborted();
+            const session = await auth.getSession(bucketId, options);
+            signal.throwIfAborted();
+            return session;
+          }),
+          onUnauthorized: () => invalidate(controller, notAuthorized("Bucket authorization is no longer valid")),
+        } };
+        emitState("connected");
+        signal.throwIfAborted();
+        return state;
+      };
+
+      try {
+        const pageUrl = new URL(window.location.href);
+        let approved = false;
+        if (await ownCallback(pageUrl, storage)) {
+          emitState("connecting");
+          await handleCallback(auth, pageUrl, signal, true);
+          approved = true;
+          context = await auth.getContext(bucketId);
+        }
+        if (context) return await publish(context, approved);
+      } catch (error) {
+        signal.throwIfAborted();
+        const failure = connectionError(error);
+        if (failure.code !== "NOT_AUTHORIZED" || !current.prompt) throw failure;
+        forceSessionRefresh = true;
+        await queue(signal, () => clearAccess(false));
       }
-      if (context) return await publish(context, approved);
-    } catch (error) {
       signal.throwIfAborted();
-      const failure = connectionError(error);
-      if (failure.code !== "NOT_AUTHORIZED" || !current.prompt) throw failure;
-      forceSessionRefresh = true;
-      await queue(signal, () => clearAccess(false));
-    }
-    signal.throwIfAborted();
-    if (!current.prompt) { emitState("disconnected"); return "disconnected"; }
-    emitState("connecting");
-    auth = makeAuth();
-    await requestAuthorization(auth, storage, authUrl, signal, popup => { authorizationPopup = popup; });
-    context = await auth.getContext(bucketId);
-    if (!context) throw notAuthorized("Authorization context unavailable");
-    return publish(context, true);
+      if (!current.prompt) { emitState("disconnected"); return "disconnected"; }
+      emitState("connecting");
+      auth = makeAuth();
+      await requestAuthorization(auth, storage, authUrl, signal, popup => { authorizationPopup = popup; });
+      context = await auth.getContext(bucketId);
+      if (!context) throw notAuthorized("Authorization context unavailable");
+      return publish(context, true);
+    } };
   }
 
   async function invoke<T>(operation: (bucket: RemoteBucket) => Promise<T>): Promise<T> {
@@ -400,15 +420,36 @@ export function createInstanceConnection(deps: {
     },
   };
 
-  function start(prompt: boolean, args: unknown[]): Promise<ConnectionState> {
+  function start(prompt: boolean, args: unknown[], legacy = false, authBase?: string): Promise<ConnectionState> {
     if (args.length) return Promise.reject(new ClientError("INVALID_INPUT", "Connection methods take no arguments"));
-    try { assertUsable(); } catch (error) { return Promise.reject(error); }
-    if (remoteClient) return Promise.resolve("connected");
-    if (flow) { flow.prompt ||= prompt; return flow.promise; }
+    try {
+      assertUsable();
+      if (authBase !== undefined) authBase = normalizeAuthUrl(authBase);
+    } catch (error) { return Promise.reject(error); }
+    if (remoteClient) {
+      if (authBase === undefined) return Promise.resolve("connected");
+      const authUrl = authBase;
+      return deps.data.get<{ authBase?: string; apiBase?: string }>(endpointsKey)
+        .then(stored => deps.data.set(endpointsKey, { ...stored, authBase: authUrl }))
+        .then(() => "connected" as const);
+    }
+    if (flow) {
+      if (authBase !== undefined) {
+        const current = flow, authUrl = authBase;
+        return current.prepared.then(prepared => {
+          if (authUrl !== prepared.authUrl) throw new ClientError("INVALID_STATE", "Authorization service cannot change during connection");
+          current.prompt ||= prompt;
+          return current.promise;
+        }, () => current.promise);
+      }
+      flow.prompt ||= prompt;
+      return flow.promise;
+    }
     const controller = new AbortController();
-    const current: ConnectionFlow = { controller, prompt, promise: null! };
+    const current: ConnectionFlow = { controller, prompt, legacy, authBase, prepared: null!, promise: null! };
     connectionController = controller;
-    current.promise = Promise.all([cleanup, keyChanges]).then(() => establish(current)).catch(async error => {
+    current.prepared = Promise.all([cleanup, keyChanges]).then(() => prepare(current));
+    current.promise = current.prepared.then(prepared => prepared.establish()).catch(async error => {
       if (controller.signal.aborted) throw controller.signal.reason;
       const failure = connectionError(error);
       controller.abort(failure);
@@ -420,6 +461,7 @@ export function createInstanceConnection(deps: {
       if (connectionController === controller) {
         connectionController = null;
         remoteClient = null;
+        localAccess = null;
         emitState("disconnected", failure);
       }
       if (failure.code === "INVALID_INSTANCE_KEY" && !current.prompt) return "disconnected" as const;
@@ -433,6 +475,7 @@ export function createInstanceConnection(deps: {
     const controller = connectionController;
     connectionController = null;
     remoteClient = null;
+    localAccess = null;
     flow = null;
     controller?.abort(reason);
     browserAuth.close();
@@ -440,6 +483,17 @@ export function createInstanceConnection(deps: {
 
   return {
     get state() { return state; },
+    get active() { return Boolean(remoteClient || flow); },
+    getLocalAccess() {
+      assertUsable();
+      if (!localAccess) throw notAuthorized("Connect before using Local synchronization");
+      return localAccess;
+    },
+    report(error: ClientError) { if (!disposed) emitState(state, error); },
+    fail(error: unknown, signal: AbortSignal) {
+      if (connectionController?.signal === signal) return invalidate(connectionController, connectionError(error));
+      return Promise.resolve();
+    },
     on(event: "state", listener: StateListener) {
       assertRuntime();
       if (event !== "state" || typeof listener !== "function") throw new ClientError("INVALID_INPUT", "A state listener is required");
@@ -467,6 +521,8 @@ export function createInstanceConnection(deps: {
     removeKey: () => changeKey(store => store.remove()),
     resume: (...args: unknown[]) => start(false, args),
     connect: (...args: unknown[]) => start(true, args),
+    resumeLegacy: () => start(false, [], true),
+    connectLegacy: (authBase?: string) => start(true, [], true, authBase),
     disconnect(): Promise<void> {
       try { assertUsable(); } catch (error) { return Promise.reject(error); }
       stop(new DOMException("Connection disconnected", "AbortError"));
@@ -478,10 +534,6 @@ export function createInstanceConnection(deps: {
       disconnecting = operation;
       emitState("disconnected");
       return operation;
-    },
-    block() {
-      stop(new ClientError("INVALID_STATE", "The same-named Local bucket exists"));
-      emitState("disconnected", new ClientError("INVALID_STATE", "The same-named Local bucket exists"));
     },
     dispose() {
       disposed = true;
