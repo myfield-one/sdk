@@ -256,6 +256,14 @@ retaining keys and objects.
 `commit()` submits app-encoded metadata and encrypted bytes against
 `expectedHeadVersionId`; null requests creation. The app owns encryption and merge.
 
+`getBucketKey()` returns `{ bucketId, keyId, cryptoKey }` for encrypting Remote
+payloads: the remote bucket ID used in API paths and the granted key as a
+non-extractable AES-GCM-256 `CryptoKey`, shared with Local sync. Use your own AAD,
+store `keyId` with ciphertext (no rotation yet), and get the handle again after each
+connect instead of persisting it. It makes no request, so revocation shows up only
+after another Remote call fails. Rejections: `NOT_AUTHORIZED`, `AbortError`,
+`INVALID_STATE`.
+
 CAS rejection returns `{ok:false, reason}`; other failures throw `ClientError`.
 After an uncertain failure, preserve version IDs, bytes and local edits.
 All Remote requests support cancellation with `{ signal }` and do not automatically retry.

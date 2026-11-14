@@ -27,7 +27,10 @@ export type VersionHistory = VersionMeta & { history: string[]; nextCursor: stri
 export type FeedPage = { entries: FeedHint[]; cursor: string; hasMore: boolean; [field: string]: unknown };
 export type BucketIndex = { bucketId: string; objects: FeedHint[]; feedCursor: string | null; hasMoreFeed: boolean; [field: string]: unknown };
 
+export type BucketKey = { bucketId: string; keyId: string; cryptoKey: CryptoKey };
+
 export interface RemoteBucket {
+  getBucketKey(options?: RequestOptions): Promise<BucketKey>;
   getCurrent(objectId: string, options?: RequestOptions & { knownVersionId?: string | null }): Promise<CurrentVersion | null>;
   getVersion(objectId: string, versionId: string, options?: RequestOptions): Promise<ObjectVersion>;
   getVersionMeta(objectId: string, versionId: string, options?: RequestOptions): Promise<VersionMeta>;
@@ -38,6 +41,8 @@ export interface RemoteBucket {
   listFeed(options?: PageOptions): Promise<FeedPage>;
   watchFeed(options?: RequestOptions): Promise<AsyncGenerator<FeedHint>>;
 }
+
+export type RemoteBucketClient = Omit<RemoteBucket, "getBucketKey">;
 
 function isHistory(value: unknown): value is string[] {
   return Array.isArray(value) && value.every(id => typeof id === "string" && id.length > 0)
@@ -76,7 +81,7 @@ function writableId(id: string): void {
   if (id === "." || id.includes("..")) throw new ClientError("INVALID_INPUT", "Dot-segment IDs cannot be committed");
 }
 
-export function createBucketClient(request: RemoteRequest, bucketId: string): RemoteBucket {
+export function createBucketClient(request: RemoteRequest, bucketId: string): RemoteBucketClient {
   const root = `/v1/api/sync/buckets/${segment(bucketId)}`;
   const objectPath = (id: string) => `${root}/objects/${segment(id)}`;
   const versionPath = (id: string, versionId: string) => `${objectPath(id)}/versions/${segment(versionId)}`;

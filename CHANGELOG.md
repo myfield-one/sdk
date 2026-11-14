@@ -2,6 +2,8 @@
 
 ## 0.9.2-alpha.1 (unreleased)
 
+- Add `remote.getBucketKey()`, returning the connected bucket ID, key ID and a
+  non-extractable `CryptoKey` for app-owned encryption.
 - Add `createInstance({ authUrl })` to choose the Auth page for every bucket of an
   Instance. Saved access keeps the API address returned by authorization.
 - Fix `connect()` racing startup `resume()`, including custom authorization URLs and cancellation.

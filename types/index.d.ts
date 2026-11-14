@@ -110,7 +110,10 @@ export type FeedHint = { objectId: string; versionId: string };
 export type FeedPage = { entries: FeedHint[]; cursor: string; hasMore: boolean; [field: string]: unknown };
 export type BucketIndex = { bucketId: string; objects: FeedHint[]; feedCursor: string | null; hasMoreFeed: boolean; [field: string]: unknown };
 
+export type BucketKey = { bucketId: string; keyId: string; cryptoKey: CryptoKey };
+
 export interface RemoteBucket {
+  getBucketKey(options?: RequestOptions): Promise<BucketKey>;
   getCurrent(objectId: string, options?: RequestOptions & { knownVersionId?: string | null }): Promise<CurrentVersion | null>;
   getVersion(objectId: string, versionId: string, options?: RequestOptions): Promise<ObjectVersion>;
   getVersionMeta(objectId: string, versionId: string, options?: RequestOptions): Promise<VersionMeta>;

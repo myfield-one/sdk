@@ -1,5 +1,5 @@
 import { ClientError } from "../errors.ts";
-import { createBucketClient, type RemoteBucket } from "./bucket.ts";
+import { createBucketClient, type RemoteBucketClient } from "./bucket.ts";
 import { createHttpRequest, isRecord, requireString, type RemoteRequest } from "./http.ts";
 
 export type RemoteClientOptions = {
@@ -10,7 +10,7 @@ export type RemoteClientOptions = {
   fetch?: typeof globalThis.fetch;
 };
 
-export type RemoteClient = { getBucket(): RemoteBucket };
+export type RemoteClient = { getBucket(): RemoteBucketClient };
 
 export function createRemoteClient(options: RemoteClientOptions): RemoteClient {
   if (!isRecord(options)) throw new ClientError("INVALID_INPUT", "Client options are required");

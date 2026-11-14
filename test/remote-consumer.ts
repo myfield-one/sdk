@@ -2,7 +2,7 @@ import {
   createInstance, ClientError,
   type CreateInstanceOptions, type RemoteBucket, type CurrentVersion, type VersionMeta,
   type PageOptions, type VersionHistory, type FeedHint, type FeedPage, type BucketIndex,
-  type ObjectVersion, type CommitInput, type CommitResult, type RequestOptions, type ClientErrorOptions,
+  type ObjectVersion, type CommitInput, type CommitResult, type RequestOptions, type ClientErrorOptions, type BucketKey,
 } from "../types/index.js";
 import type * as Source from "../src/index.ts";
 
@@ -14,6 +14,7 @@ type DeclarationParity = [
   Assert<Same<ReturnType<typeof createInstance>["connect"], Source.Instance["connect"]>>,
   Assert<Same<ReturnType<typeof createInstance>["on"], Source.Instance["on"]>>,
   Assert<Same<RemoteBucket, Source.RemoteBucket>>,
+  Assert<Same<BucketKey, Source.BucketKey>>,
   Assert<Same<PageOptions, Source.PageOptions>>,
   Assert<Same<VersionHistory, Source.VersionHistory>>,
   Assert<Same<FeedHint, Source.FeedHint>>,
@@ -49,6 +50,8 @@ createInstance("notes.example.com", { storage: "memory" });
 instance.connect({ authBase: "https://example.com/auth/" });
 const signal = new AbortController().signal;
 const head: CurrentVersion | null = await remote.getCurrent("note", { signal });
+const bucketKey: BucketKey = await remote.getBucketKey({ signal });
+const bucketCryptoKey: CryptoKey = bucketKey.cryptoKey;
 if (head) {
   const version: ObjectVersion = await remote.getVersion("note", head.versionId, { signal });
   await version.payload.arrayBuffer();
