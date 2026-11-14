@@ -159,7 +159,8 @@ const offChange = bucket.on("change", (objectId) => {});
 ```
 
 - Call `resume()` on app boot. It completes pending auth callbacks and restores
-  existing authorization without prompting.
+  existing authorization without prompting. Concurrent `connect()` waits for it, then
+  reuses restored access or starts authorization.
 - Call `connect()` from a user gesture. It validates the server session when establishing
   a connection, opening authorization when needed. Already-connected calls reuse access.
 - Automatic sync defaults to true. Set `autoSync: false` to stop automatic triggers;
