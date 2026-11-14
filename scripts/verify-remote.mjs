@@ -16,20 +16,10 @@ if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Invali
 const origin = `http://127.0.0.1:${port}`;
 await fs.mkdir(path.join(root, "tmp/remote-verification"), { recursive: true });
 const output = await fs.mkdtemp(path.join(root, "tmp/remote-verification/run-"));
-let overrides = 0;
 const bundle = await build({ entryPoints: [path.join(root, "scripts/verify-remote-browser.js")],
   bundle: true, format: "esm", target: "es2022", write: false, metafile: true, absWorkingDir: root,
-  plugins: [{ name: "test-authorization", setup(builder) {
-    builder.onLoad({ filter: /\/remote\/connection\.ts$/ }, async ({ path: filename }) => {
-      const source = await fs.readFile(filename, "utf8");
-      const declaration = 'const DEFAULT_AUTH_URL = "https://myfield.one/auth/";';
-      if (!source.includes(declaration)) throw new Error("Default authorization declaration changed");
-      overrides++;
-      return { loader: "ts", contents: source.replace(declaration, `const DEFAULT_AUTH_URL = ${JSON.stringify(authUrl.href)};`) };
-    });
-  } }],
+  define: { __MYFIELD_TEST_AUTH_URL__: JSON.stringify(authUrl.href) },
 });
-if (overrides !== 1) throw new Error("Expected one test authorization override");
 const code = bundle.outputFiles[0].contents;
 const hash = contents => createHash("sha256").update(contents).digest("hex");
 const sources = {};

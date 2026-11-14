@@ -14,11 +14,19 @@ createInstance(options?: {
   appId?: string;
   namespace?: string; // Existing storage scope.
   storage?: "indexeddb" | "memory";
+  authUrl?: string; // Defaults to https://myfield.one/auth/.
 }): Instance;
 ```
 
 `appId` defaults to the browser hostname. Use lowercase ASCII domain-form names,
 1–63 characters.
+
+`authUrl` is the Auth page opened when authorization is needed, for example a dev page.
+It must be an absolute HTTP(S) page URL without credentials, query or fragment, is used
+as given and applies to every bucket of the Instance. Saved access keeps the API address
+returned by authorization, also after `authUrl` changes. To switch environments on one
+origin, use a separate `namespace` per environment, or call `disconnect()` before
+`connect()`.
 
 ## Buckets
 
@@ -164,7 +172,8 @@ const offChange = bucket.on("change", (objectId) => {});
 - Call `connect()` from a user gesture. It validates the server session when establishing
   a connection, opening authorization when needed. Already-connected calls reuse access.
 - Automatic sync defaults to true. Set `autoSync: false` to stop automatic triggers;
-  Local CRUD, manual `bucket.sync()` and Remote requests remain available.
+  a pass already running finishes. Local CRUD, manual `bucket.sync()` and Remote
+  requests remain available.
 - Browser lifecycle sync is app-owned. Apps may call `bucket.sync()` on focus,
   visibility, or online events.
 - `disconnect()` drops this resource's connection and authorization, retaining Local data.
@@ -176,7 +185,8 @@ shorthand for `setAutoSync()` followed by connecting.
 
 Bucket `resume`/`connect`/`disconnect` manage that bucket's own connection; use them for
 buckets from `createBucket()` and Instance methods for the default bucket.
-`bucket.connect` also accepts `autoSync` and `authBase`, the full authorization page URL.
+`bucket.connect` also accepts `autoSync`; set the Auth page with
+`createInstance({ authUrl })`.
 Invalid calls reject; authorization failures resolve `"disconnected"` and report the
 error through the state event.
 
@@ -241,7 +251,7 @@ returns metadata and a payload Response; consume or cancel its body.
 to authorize or recover from `NOT_AUTHORIZED`; network failures never open authorization.
 Both return the connection state; `on("state")` reports changes and errors.
 `disconnect()` clears shared bucket access and pending requests across tabs,
-retaining keys, objects and endpoints.
+retaining keys and objects.
 
 `commit()` submits app-encoded metadata and encrypted bytes against
 `expectedHeadVersionId`; null requests creation. The app owns encryption and merge.

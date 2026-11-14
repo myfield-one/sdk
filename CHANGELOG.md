@@ -2,11 +2,15 @@
 
 ## 0.9.2-alpha.1 (unreleased)
 
+- Add `createInstance({ authUrl })` to choose the Auth page for every bucket of an
+  Instance. Saved access keeps the API address returned by authorization.
 - Fix `connect()` racing startup `resume()`, including custom authorization URLs and cancellation.
 - Unify Local and Remote connections, add `instance.getBucket()` and optional auto-sync
   control on connect/resume. Keep manual sync available and validate legacy upload ACKs.
-- Breaking: legacy `bucket.connect({ authBase })` no longer appends `/auth/` or infers
-  API hosts; pass the full authorization page URL. The API address comes from the grant.
+- Breaking: `bucket.connect()` no longer accepts `authBase`; pass the full Auth page URL
+  as `createInstance({ authUrl })`. No API host is inferred; it comes from the grant.
+  A custom `authBase` saved by 0.9.1 is ignored: existing access keeps working, but the
+  next authorization opens `authUrl` or the default production Auth page.
 - Fixed Local sync marking a write synchronized when the server answered HTTP 200 with
   `{ ok: false }`; unauthorized acknowledgements now invalidate access.
 - Automatic sync now follows connection state and `setAutoSync()` without requiring

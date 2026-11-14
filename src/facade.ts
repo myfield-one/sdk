@@ -30,7 +30,7 @@ import { randomId } from "./internal/encoding.ts";
 import { resolveAppId } from "./auth/identifiers.ts";
 import type { InstanceKey } from "./auth/keys.ts";
 
-import { createInstanceConnection } from "./remote/connection.ts";
+import { createInstanceConnection, normalizeAuthUrl } from "./remote/connection.ts";
 import type { RemoteBucket } from "./remote/bucket.ts";
 
 const INDEX_OBJECT_ID = "~index";
@@ -42,6 +42,7 @@ export type CreateInstanceOptions = {
   namespace?: string;
   storage?: "indexeddb" | "memory";
   appId?: string;
+  authUrl?: string;
 };
 
 export type BucketState = "disconnected" | "connecting" | "connected";
@@ -49,7 +50,6 @@ export type BucketState = "disconnected" | "connecting" | "connected";
 export type ListEntry = { id: string; updatedAt: string; deleted?: true };
 
 export type ConnectOptions = {
-  authBase?: string;
   autoSync?: boolean;
 };
 
@@ -104,7 +104,7 @@ export function createInstance(input: string | CreateInstanceOptions = {}, ...ex
   const options: CreateInstanceOptions = typeof input === "string" ? { appId: input } : input;
   if (!options || typeof options !== "object" || Array.isArray(options)) throw new ClientError("INVALID_INPUT", "Instance options are required");
   if (["authStorage", "dbName", "storeName"].some(key => key in options)) throw new ClientError("INVALID_INPUT", "Custom database configuration is not supported");
-  if ("authUrl" in options) throw new ClientError("INVALID_INPUT", "Custom authorization URLs are not supported by the Instance API");
+  const authUrl = options.authUrl === undefined ? undefined : normalizeAuthUrl(options.authUrl);
   const explicitAppId = options.appId === undefined ? undefined : resolveAppId(options.appId);
   let resolvedAppId = explicitAppId;
   const getAppId = () => resolvedAppId ??= resolveAppId();
@@ -121,7 +121,7 @@ export function createInstance(input: string | CreateInstanceOptions = {}, ...ex
   const connections = new Map<string, ReturnType<typeof createInstanceConnection>>();
   const connectionDeps = { getAppId, data: baseAdapter, auth: authAdapter,
     hasActiveConnection: () => connection.active || [...connections.values()].some(value => value.active),
-    persistent: storageKind !== "memory" };
+    persistent: storageKind !== "memory", authUrl };
   const connection = createInstanceConnection(connectionDeps);
   let disposed = false;
 
@@ -584,7 +584,7 @@ function createBucketFacade(deps: BucketDeps) {
 
   // 0.9.1 semantics: invalid calls reject; authorization-flow failures resolve
   // "disconnected" after the state event carries the error.
-  async function connectLegacy(prompt: boolean, authBase?: string): Promise<BucketState> {
+  async function connectLegacy(prompt: boolean): Promise<BucketState> {
     if (disposed) throw new Error("disposed");
     await ensureClient();
     if (typeof window === "undefined") {
@@ -593,7 +593,7 @@ function createBucketFacade(deps: BucketDeps) {
     }
     let next: BucketState;
     try {
-      next = await (prompt ? connection.connectLegacy(authBase) : connection.resumeLegacy());
+      next = await (prompt ? connection.connect() : connection.resume());
     } catch (error) {
       if (error === lastFailure || isAbortError(error)) return "disconnected";
       throw error;
@@ -621,8 +621,11 @@ function createBucketFacade(deps: BucketDeps) {
     list,
     resume: () => connectLegacy(false),
     connect(options) {
+      if (options && typeof options === "object" && (options as { authBase?: unknown }).authBase !== undefined) {
+        return Promise.reject(new ClientError("INVALID_INPUT", "Pass the authorization page as createInstance({ authUrl })"));
+      }
       if (options?.autoSync !== undefined) this.setAutoSync(options.autoSync);
-      return connectLegacy(true, options?.authBase || undefined);
+      return connectLegacy(true);
     },
     disconnect: () => connection.disconnect(),
     async sync() {
