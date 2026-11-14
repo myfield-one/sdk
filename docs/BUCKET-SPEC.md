@@ -149,6 +149,11 @@ The SDK derives:
 
 Raw key bytes are zeroed after derivation.
 
+The encrypted callback also returns `resourceApiUrl`; SDKs use it as the API
+address and do not encode deployment host rules. `bucketAccessGrant.resourceId`
+identifies the remote sync resource; `envelope.bucketId` is optional
+compatibility metadata.
+
 ## Sync Behavior Relevant To Format
 
 The worker is a relay: it never decrypts payloads, but lists current

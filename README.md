@@ -38,14 +38,13 @@ const entries = await bucket.list({ prefix: "note:" });
 await instance.connect(); // defaults to https://myfield.one/auth/
 ```
 
+Full API reference: [`docs/API.md`](docs/API.md).
+
 ## Remote object access
 
-Use `createInstance("notes.example.com")`, then `instance.resume({ autoSync: false })` on startup
-and `instance.connect({ autoSync: false })` from a user action. `instance.remote.getBucket()` provides
-object reads, CAS commits, version history and change notifications.
-The SDK reuses instance authorization; the app owns payload encryption and local
-storage.
-See [Remote Object API](docs/API.md#remote-object-api).
+`instance.remote.getBucket()` provides object reads, CAS commits, version history and
+change notifications with the instance's authorization; the app owns payload encryption
+and local storage. See [Remote Object API](docs/API.md#remote-object-api).
 
 ## What the SDK handles
 
@@ -85,20 +84,6 @@ See [Remote Object API](docs/API.md#remote-object-api).
 - **Freshness, not realtime collaboration**: the pull model targets
   single-user multi-device freshness, not millisecond multi-user
   collaboration or presence.
-
-## Current service status
-
-The Local facade does not expose `apiBase`. The auth service returns
-`resourceApiUrl` in the encrypted callback result, so SDKs do not encode
-deployment host rules. The SDK uses `bucketAccessGrant.resourceId` as the
-remote sync resource id, with `envelope.bucketId` treated as optional
-compatibility metadata.
-
-Deferred service work after this preview release:
-
-- A bucket-scoped hibernatable WebSocket feed under the resource API root.
-  SSE remains compatibility/development-only; SDK fallback is timer
-  sync over the object index and feed.
 
 ## Public entry
 

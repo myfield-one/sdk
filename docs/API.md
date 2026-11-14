@@ -4,20 +4,7 @@
 writes work without an account. `connect()` binds the bucket to Myfield auth and
 encrypted sync.
 
-## Quickstart
-
-```ts
-import { createInstance } from "@myfield/sdk";
-
-const instance = createInstance("notes.example.com");
-const bucket = instance.getBucket();
-
-await bucket.put("note:1", { title: "hello", body: "world" });
-const note = await bucket.get("note:1");
-const notes = await bucket.list({ prefix: "note:" });
-
-await instance.connect();
-```
+For an overview, quickstart and service boundaries, see the [README](../README.md).
 
 ## `createInstance`
 
@@ -215,15 +202,6 @@ The returned function unsubscribes the listener.
   surfaced through state details and retried by auto-sync.
 - A cloud miss is not an error. `get()` returns `null`, and another device that
   still has the object can re-upload it on sync.
-
-## Boundaries
-
-- Myfield sync is a relay, not a backup. Apps should keep their own export or
-  durability story when user data must be archival.
-- Content and object ids are encrypted/blinded before reaching Myfield. Traffic
-  timing, sizes, and counts are still visible to the platform.
-- Web clients cannot hide the browser `Origin` header from sync/auth requests.
-- v1 is freshness sync, not realtime collaborative editing.
 
 ## Not In V1
 
