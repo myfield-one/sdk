@@ -14,11 +14,17 @@ createInstance(options?: {
   appId?: string;
   namespace?: string; // Existing storage scope.
   storage?: "indexeddb" | "memory";
+  authUrl?: string; // Defaults to https://myfield.one/auth/.
 }): Instance;
 ```
 
 `appId` defaults to the browser hostname. Use lowercase ASCII domain-form names,
 1–63 characters.
+
+`authUrl` selects the authorization environment, for example a dev Auth page. It must
+be an exact absolute HTTP(S) page URL; API addresses still come from the grant. Saved
+access from another `authUrl` is kept but not reused: `resume()` returns
+`"disconnected"` and `connect()` authorizes again.
 
 ## Buckets
 

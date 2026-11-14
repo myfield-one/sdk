@@ -20,6 +20,7 @@ export type CreateInstanceOptions = {
   namespace?: string;
   appId?: string;
   storage?: "indexeddb" | "memory";
+  authUrl?: string;
 };
 
 export type BucketState = "disconnected" | "connecting" | "connected";

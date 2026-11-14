@@ -40,7 +40,7 @@ function connectionError(error: unknown): ClientError {
   return new ClientError("INVALID_STATE", error instanceof Error ? error.message : "Connection failed", { cause: error });
 }
 
-function normalizeAuthUrl(value: string): string {
+export function normalizeAuthUrl(value: string): string {
   let url: URL;
   try { url = new URL(value); }
   catch (cause) { throw new ClientError("INVALID_INPUT", "authUrl must be an absolute HTTP(S) URL", { cause }); }
@@ -69,6 +69,7 @@ export function createInstanceConnection(deps: {
   auth: StorageAdapter;
   hasActiveConnection?(): boolean;
   persistent?: boolean;
+  authUrl?: string;
 }) {
   let bucketId: string, resourceId: string, endpointsKey: string;
   const storageAppId = deps.getAppId;
@@ -262,7 +263,8 @@ export function createInstanceConnection(deps: {
     signal.throwIfAborted();
     const storage = guardedStorage(signal, storageAppId());
     let authorizationPopup: Window | null = null;
-    let authUrl = current.legacy ? normalizeAuthUrl(stored?.authBase || DEFAULT_AUTH_URL) : DEFAULT_AUTH_URL;
+    const configuredAuthUrl = deps.authUrl ?? DEFAULT_AUTH_URL;
+    let authUrl = current.legacy ? normalizeAuthUrl(stored?.authBase || configuredAuthUrl) : configuredAuthUrl;
     const makeAuth = (apiBase?: string) => createInstanceAuthClient({
       appId: storageAppId(), apiBase, storage,
       fetchImpl: apiBase ? (input, init) => {
@@ -282,7 +284,12 @@ export function createInstanceConnection(deps: {
     });
     let auth = makeAuth();
     let context = await auth.getContext(bucketId);
-    if (context) authUrl = normalizeAuthUrl(stored?.authBase || DEFAULT_AUTH_URL);
+    if (context) {
+      // Access saved without endpoints predates custom Auth URLs and came from the default.
+      const savedAuthUrl = normalizeAuthUrl(stored?.authBase || DEFAULT_AUTH_URL);
+      if (current.legacy || savedAuthUrl === configuredAuthUrl) authUrl = savedAuthUrl;
+      else context = null;
+    }
     return { authUrl, establish: async (): Promise<ConnectionState> => {
       const publish = async (next: InstanceAuthContext, approved: boolean) => {
         signal.throwIfAborted();

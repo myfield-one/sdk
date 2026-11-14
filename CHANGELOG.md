@@ -2,6 +2,9 @@
 
 ## 0.9.2-alpha.1 (unreleased)
 
+- Add `createInstance({ authUrl })` to select the authorization environment. Instance
+  connections reuse saved access only when it was authorized at the same `authUrl`;
+  apps that saved a custom legacy `authBase` should pass it as `authUrl`.
 - Fix `connect()` racing startup `resume()`, including custom authorization URLs and cancellation.
 - Unify Local and Remote connections, add `instance.getBucket()` and optional auto-sync
   control on connect/resume. Keep manual sync available and validate legacy upload ACKs.

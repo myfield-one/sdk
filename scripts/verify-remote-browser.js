@@ -87,7 +87,8 @@ async function verifyDisconnect(instance, signal) {
   return { streamCancelled: true };
 }
 
-const instance = createInstance("sdk-remote-verification.example");
+// __MYFIELD_TEST_AUTH_URL__ is defined by scripts/verify-remote.mjs.
+const instance = createInstance({ appId: "sdk-remote-verification.example", authUrl: __MYFIELD_TEST_AUTH_URL__ });
 const status = document.getElementById("status"), result = document.getElementById("result");
 const connect = document.getElementById("connectButton"), verify = document.getElementById("verifyButton");
 instance.on("state", (state, error) => { status.textContent = state + (error ? ": " + error.code : ""); verify.disabled = state !== "connected"; });

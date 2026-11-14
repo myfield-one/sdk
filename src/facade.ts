@@ -30,7 +30,7 @@ import { randomId } from "./internal/encoding.ts";
 import { resolveAppId } from "./auth/identifiers.ts";
 import type { InstanceKey } from "./auth/keys.ts";
 
-import { createInstanceConnection } from "./remote/connection.ts";
+import { createInstanceConnection, normalizeAuthUrl } from "./remote/connection.ts";
 import type { RemoteBucket } from "./remote/bucket.ts";
 
 const INDEX_OBJECT_ID = "~index";
@@ -42,6 +42,7 @@ export type CreateInstanceOptions = {
   namespace?: string;
   storage?: "indexeddb" | "memory";
   appId?: string;
+  authUrl?: string;
 };
 
 export type BucketState = "disconnected" | "connecting" | "connected";
@@ -104,7 +105,7 @@ export function createInstance(input: string | CreateInstanceOptions = {}, ...ex
   const options: CreateInstanceOptions = typeof input === "string" ? { appId: input } : input;
   if (!options || typeof options !== "object" || Array.isArray(options)) throw new ClientError("INVALID_INPUT", "Instance options are required");
   if (["authStorage", "dbName", "storeName"].some(key => key in options)) throw new ClientError("INVALID_INPUT", "Custom database configuration is not supported");
-  if ("authUrl" in options) throw new ClientError("INVALID_INPUT", "Custom authorization URLs are not supported by the Instance API");
+  const authUrl = options.authUrl === undefined ? undefined : normalizeAuthUrl(options.authUrl);
   const explicitAppId = options.appId === undefined ? undefined : resolveAppId(options.appId);
   let resolvedAppId = explicitAppId;
   const getAppId = () => resolvedAppId ??= resolveAppId();
@@ -121,7 +122,7 @@ export function createInstance(input: string | CreateInstanceOptions = {}, ...ex
   const connections = new Map<string, ReturnType<typeof createInstanceConnection>>();
   const connectionDeps = { getAppId, data: baseAdapter, auth: authAdapter,
     hasActiveConnection: () => connection.active || [...connections.values()].some(value => value.active),
-    persistent: storageKind !== "memory" };
+    persistent: storageKind !== "memory", authUrl };
   const connection = createInstanceConnection(connectionDeps);
   let disposed = false;
 
