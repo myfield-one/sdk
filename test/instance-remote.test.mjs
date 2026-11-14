@@ -130,9 +130,7 @@ test("connect joins authorization, persists legacy context/endpoints and uses ca
   const { wire } = await env.approve({ remoteBucketId: "remote.example.com" });
   await first;
   assert.equal(wire.resource_id, `urn:myfield:bucket:${env.namespace}`);
-  assert.deepEqual(await env.data.get(`meta:${env.namespace}:endpoints`), {
-    authBase: "https://myfield.one/auth/", apiBase: "https://api.example.test",
-  });
+  assert.deepEqual(await env.data.get(`meta:${env.namespace}:endpoints`), { apiBase: "https://api.example.test" });
   const auth = createInstanceAuthClient({ appId: "app.example.com", storage: env.auth });
   const context = await auth.getContext(env.namespace);
   assert.equal(context.v, 1); assert.equal(context.resourceApiUrl, "https://api.example.test/v1/api/sync");
@@ -159,7 +157,7 @@ test("disconnect clears access but preserves endpoints, identity and data", asyn
   const before = await env.auth.get("instance:app.example.com:active-instance:current");
   const handle = instance.remote.getBucket();
   await instance.disconnect();
-  assert.equal((await env.data.get(`meta:${env.namespace}:endpoints`))?.authBase, "https://myfield.one/auth/");
+  assert.equal((await env.data.get(`meta:${env.namespace}:endpoints`))?.apiBase, "https://api.example.test");
   assert.deepEqual(await env.auth.get("instance:app.example.com:active-instance:current"), before);
   assert.deepEqual(await env.data.get("data:unrelated:obj:note"), { text: "local" });
   assert.equal((await env.auth.keys("instance:app.example.com:context:")).length, 0);
@@ -187,7 +185,7 @@ test("saved access failures retain grants without prompting, and disconnect allo
     : Response.json({ credential: { carrier: "bearer", token: "new", expiresAt: new Date(Date.now() + 7200_000).toISOString() } }));
   const again = instance.connect(); await until(() => env.opened.length === 2);
   await env.approve({ apiBase: "https://custom-api.example" }); await again;
-  assert.equal((await env.data.get(`meta:${env.namespace}:endpoints`)).authBase, "https://myfield.one/auth/");
+  assert.equal((await env.data.get(`meta:${env.namespace}:endpoints`)).apiBase, "https://custom-api.example");
 });
 
 test("same-named legacy Bucket and Instance share authorization", async t => {
@@ -371,9 +369,7 @@ test("legacy inferred endpoints are accepted without being rewritten on restore"
   const connecting = instance.connect(); await env.approve(); await connecting; stop(instance);
   const endpoints = { authBase: "https://custom.example/auth/", apiBase: "https://api.custom.example" };
   await env.data.set(`meta:${env.namespace}:endpoints`, endpoints);
-  instance = createInstance({ appId: env.namespace, authUrl: endpoints.authBase });
-  t.after(() => stop(instance));
-  await instance.connect();
+  instance = env.instance(); await instance.connect();
   assert.deepEqual(await env.data.get(`meta:${env.namespace}:endpoints`), endpoints);
   assert.equal(env.opened.length, 1);
 });
@@ -833,9 +829,7 @@ test("appId selects authorization independently from legacy storage scope", asyn
   const db = createIndexedDbStorageAdapter({ dbName: "myfield-sdk:default" });
   assert.equal((await db.keys("auth:instance:notes.example.com:instance-key:")).length, 1);
   assert.equal((await db.keys("auth:instance:app.example.com:")).length, 0);
-  assert.deepEqual(await db.get("meta:notes.example.com:endpoints"), {
-    authBase: "https://myfield.one/auth/", apiBase: "https://api.example.test",
-  });
+  assert.deepEqual(await db.get("meta:notes.example.com:endpoints"), { apiBase: "https://api.example.test" });
 });
 
 test("no-argument initialization resumes existing hostname identity in the default database", async t => {
@@ -1193,19 +1187,19 @@ test("shared authorization cancellation rejects Instance callers and resolves le
   assert.equal(env.opened.length, 1);
 });
 
-for (const authBase of ["https://myfield.one/auth/", "https://MYFIELD.ONE/auth"])
-test(`legacy connect joins Instance authorization at ${authBase}`, async t => {
+test("legacy connect joins Instance authorization", async t => {
   const env = browser(t), instance = env.instance();
   const first = instance.connect({ autoSync: false });
-  const second = instance.getBucket().connect({ authBase, autoSync: false });
+  const second = instance.getBucket().connect({ autoSync: false });
   await env.approve();
   assert.deepEqual(await Promise.all([first, second]), ["connected", "connected"]);
   assert.equal(env.opened.length, 1);
 });
 
 test("legacy connect joins saved custom authorization without changing its address", async t => {
-  const env = browser(t), original = env.instance();
-  const first = original.getBucket().connect({ authBase: "https://custom.example/auth/", autoSync: false });
+  const env = browser(t), original = createInstance({ appId: env.namespace, authUrl: "https://custom.example/auth/" });
+  t.after(() => stop(original));
+  const first = original.getBucket().connect({ autoSync: false });
   await env.approve(); await first; stop(original);
   const entered = deferred(), release = deferred();
   t.after(() => release.resolve());
@@ -1221,29 +1215,31 @@ test("legacy connect joins saved custom authorization without changing its addre
   await instance.getBucket().ready();
   const restoring = instance.connect({ autoSync: false });
   await entered.promise;
-  const joined = instance.getBucket().connect({ authBase: "https://custom.example/auth", autoSync: false });
+  const joined = instance.getBucket().connect({ autoSync: false });
   await tick();
   release.resolve();
   assert.deepEqual(await Promise.all([restoring, joined]), ["connected", "connected"]);
-  assert.equal((await env.data.get(`meta:${env.namespace}:endpoints`)).authBase, "https://custom.example/auth/");
+  assert.equal((await env.data.get(`meta:${env.namespace}:endpoints`)).apiBase, "https://api.example.test");
   assert.equal(env.opened.length, 1);
 });
 
-test("a concurrent legacy connect cannot change the authorization service", async t => {
+test("bucket connect rejects a per-call authBase without affecting a pending flow", async t => {
   const env = browser(t), instance = env.instance();
   const first = instance.connect({ autoSync: false });
   await until(() => env.opened[0]?.location.href.includes("authRequest"));
-  await assert.rejects(instance.getBucket().connect({ authBase: "https://other.example/auth/", autoSync: false }), code("INVALID_STATE"));
+  await assert.rejects(instance.getBucket().connect({ authBase: "https://other.example/auth/", autoSync: false }), code("INVALID_INPUT"));
   assert.equal(instance.state, "connecting");
   await env.approve(); assert.equal(await first, "connected");
-  assert.equal((await env.data.get(`meta:${env.namespace}:endpoints`)).authBase, "https://myfield.one/auth/");
+  assert.equal((await env.data.get(`meta:${env.namespace}:endpoints`)).apiBase, "https://api.example.test");
   assert.equal(env.opened.length, 1);
 });
 
 test("legacy connect waits for startup resume before selecting its authorization page", async t => {
-  const env = browser(t), local = env.instance().getBucket();
+  const env = browser(t), instance = createInstance({ appId: env.namespace, authUrl: "https://custom.example/auth/" });
+  t.after(() => stop(instance));
+  const local = instance.getBucket();
   const restoring = local.resume();
-  const connecting = local.connect({ authBase: "https://custom.example/auth/", autoSync: false });
+  const connecting = local.connect({ autoSync: false });
   await until(() => env.opened[0]?.location.href.includes("authRequest"));
   assert.equal(new URL(env.opened[0].location.href).origin, "https://custom.example");
   await env.approve();
@@ -1312,8 +1308,8 @@ test(`${legacy ? "Bucket" : "Instance"} connect waiting for resume handles ${res
   const restoring = instance.resume({ autoSync: false });
   const resumeResult = restoring.catch(error => error);
   await entered.promise;
-  const authUrl = legacy ? "https://custom.example/auth/" : "https://myfield.one/auth/";
-  const connecting = legacy ? instance.getBucket().connect({ authBase: authUrl, autoSync: false }) : instance.connect({ autoSync: false });
+  const authUrl = "https://myfield.one/auth/";
+  const connecting = legacy ? instance.getBucket().connect({ autoSync: false }) : instance.connect({ autoSync: false });
   const connectResult = connecting.catch(error => error);
   let cancelled = Promise.resolve();
   if (result === "revoked-disconnect") instance.on("state", (_state, error) => {
@@ -1335,7 +1331,7 @@ test(`${legacy ? "Bucket" : "Instance"} connect waiting for resume handles ${res
   } else if (result === "success") {
     assert.equal(await resumeResult, "connected");
     assert.equal(await connectResult, "connected");
-    assert.equal((await env.data.get(`meta:${env.namespace}:endpoints`)).authBase, authUrl);
+    assert.equal((await env.data.get(`meta:${env.namespace}:endpoints`)).apiBase, "https://api.example.test");
   } else {
     const error = await resumeResult;
     assert.equal(error.name === "AbortError" || ["NETWORK_ERROR", "NOT_AUTHORIZED"].includes(error.code), true);
@@ -1345,14 +1341,6 @@ test(`${legacy ? "Bucket" : "Instance"} connect waiting for resume handles ${res
   }
   await cancelled;
   assert.equal(env.opened.length, result === "revoked" ? 2 : 1);
-});
-
-test("an empty legacy authBase preserves the saved authorization address", async t => {
-  const env = browser(t), instance = env.instance(), local = instance.getBucket();
-  const connecting = local.connect({ authBase: "https://custom.example/auth/", autoSync: false });
-  await env.approve(); assert.equal(await connecting, "connected");
-  assert.equal(await local.connect({ authBase: "" }), "connected");
-  assert.equal((await env.data.get(`meta:${env.namespace}:endpoints`)).authBase, "https://custom.example/auth/");
 });
 
 test("Local CAS rejection retries without marking an unaccepted write as synchronized", async t => {
@@ -1431,29 +1419,25 @@ test("Local verification authorization failure disconnects shared access", async
   assert.equal(instance.state, "disconnected");
 });
 
-test("legacy authBase is used as the exact authorization page without endpoint inference", async t => {
-  const env = browser(t), local = env.instance().getBucket();
-  await assert.rejects(local.connect({ authBase: "/auth/" }), code("INVALID_INPUT"));
-  await assert.rejects(local.connect({ authBase: "https://custom.example/auth/?x=1" }), code("INVALID_INPUT"));
-  assert.equal(env.opened.length, 0);
-  const first = local.connect({ authBase: "https://auth.example.test", autoSync: false });
+test("authUrl is used as the exact authorization page without endpoint inference", async t => {
+  const env = browser(t), instance = createInstance({ appId: env.namespace, authUrl: "https://auth.example.test" });
+  t.after(() => stop(instance));
+  const first = instance.getBucket().connect({ autoSync: false });
   await until(() => env.opened[0]?.location.href.includes("authRequest"));
   const page = new URL(env.opened[0].location.href);
   assert.equal(page.origin + page.pathname, "https://auth.example.test/");
   await env.approve();
   assert.equal(await first, "connected");
-  assert.deepEqual(await env.data.get(`meta:${env.namespace}:endpoints`), {
-    authBase: "https://auth.example.test/", apiBase: "https://api.example.test",
-  });
+  assert.deepEqual(await env.data.get(`meta:${env.namespace}:endpoints`), { apiBase: "https://api.example.test" });
   assert.equal(env.calls.some(call => call.url.hostname === "api.auth.example.test"), false);
   assert.equal(env.opened.length, 1);
 });
 
-test("a repeated legacy connect with an equivalent authBase joins the pending flow", async t => {
+test("a repeated bucket connect joins the pending flow", async t => {
   const env = browser(t), local = env.instance().getBucket();
-  const first = local.connect({ authBase: "https://custom.example/auth", autoSync: false });
+  const first = local.connect({ autoSync: false });
   await until(() => env.opened[0]?.location.href.includes("authRequest"));
-  const second = local.connect({ authBase: "https://custom.example/auth/", autoSync: false });
+  const second = local.connect({ autoSync: false });
   await env.approve();
   assert.deepEqual(await Promise.all([first, second]), ["connected", "connected"]);
   assert.equal(env.opened.length, 1);
@@ -1528,11 +1512,9 @@ test("enabling autoSync after an autoSync false connect starts sync without read
   local.setAutoSync(true);
   await until(() => env.calls.slice(before).some(call => call.url.pathname.endsWith("/current")));
   local.setAutoSync(false);
-  let seen = -1;
-  while (seen !== env.calls.length) { seen = env.calls.length; await new Promise(done => setTimeout(done, 30)); }
   await local.put("note", { text: "manual" });
   await new Promise(done => setTimeout(done, 50));
-  assert.equal(env.calls.slice(seen).some(call => call.body instanceof FormData), false);
+  assert.equal(env.calls.some(call => call.body instanceof FormData), false);
 });
 
 test("deprecated ready() does not open storage", async t => {
@@ -1614,45 +1596,30 @@ test("authUrl selects the authorization page and is saved with the granted API a
   assert.equal(pageOf(env.opened[0]), DEV_AUTH);
   await env.approve();
   assert.equal(await connecting, "connected");
-  assert.deepEqual(await env.data.get(`meta:${env.namespace}:endpoints`), { authBase: DEV_AUTH, apiBase: "https://api.example.test" });
+  assert.deepEqual(await env.data.get(`meta:${env.namespace}:endpoints`), { apiBase: "https://api.example.test" });
 });
 
-test("access saved by another Auth environment is kept but not reused until reauthorized", async t => {
+test("changing authUrl only selects where to authorize; saved access keeps its API address", async t => {
   const env = browser(t), prod = env.instance();
-  let connecting = prod.connect({ autoSync: false }); await env.approve(); await connecting; stop(prod);
+  const connecting = prod.connect({ autoSync: false }); await env.approve(); await connecting; stop(prod);
   const dev = createInstance({ appId: env.namespace, authUrl: DEV_AUTH });
   t.after(() => stop(dev));
-  const calls = env.calls.length;
-  assert.equal(await dev.resume(), "disconnected");
-  assert.equal(env.calls.length, calls);
+  assert.equal(await dev.resume({ autoSync: false }), "connected");
   assert.equal(env.opened.length, 1);
-  assert.equal((await env.auth.keys(`instance:${env.namespace}:context:`)).length, 1);
-  assert.equal((await env.data.get(`meta:${env.namespace}:endpoints`)).authBase, "https://myfield.one/auth/");
-  connecting = dev.connect({ autoSync: false });
-  await until(() => env.opened.length === 2 && env.opened[1].location.href.includes("authRequest"));
-  assert.equal(pageOf(env.opened[1]), DEV_AUTH);
-  await env.approve();
-  assert.equal(await connecting, "connected");
-  assert.equal((await env.data.get(`meta:${env.namespace}:endpoints`)).authBase, DEV_AUTH);
-  stop(dev);
-  const restored = createInstance({ appId: env.namespace, authUrl: DEV_AUTH });
-  t.after(() => stop(restored));
-  assert.equal(await restored.resume(), "connected");
-  assert.equal(env.opened.length, 2);
+  assert.equal(await dev.remote.getBucket().getCurrent("note"), null);
+  assert.equal(env.calls.at(-1).url.origin, "https://api.example.test");
 });
 
-test("legacy authBase overrides the Instance authUrl, which remains the legacy default", async t => {
+test("every bucket of an Instance uses its authUrl", async t => {
   const env = browser(t);
   const instance = createInstance({ appId: env.namespace, authUrl: DEV_AUTH });
   t.after(() => stop(instance));
-  const explicit = instance.getBucket().connect({ authBase: "https://custom.example/auth/", autoSync: false });
+  await assert.rejects(instance.getBucket().connect({ authBase: "https://custom.example/auth/" }), code("INVALID_INPUT"));
+  const archive = instance.createBucket({ id: "archive.example.com" }).connect({ autoSync: false });
   await until(() => env.opened[0]?.location.href.includes("authRequest"));
-  assert.equal(pageOf(env.opened[0]), "https://custom.example/auth/");
+  assert.equal(pageOf(env.opened[0]), DEV_AUTH);
   await env.approve();
-  assert.equal(await explicit, "connected");
-  const fallback = instance.createBucket({ id: "archive.example.com" }).connect({ autoSync: false });
-  await until(() => env.opened.length === 2 && env.opened[1].location.href.includes("authRequest"));
-  assert.equal(pageOf(env.opened[1]), DEV_AUTH);
-  await env.approve();
-  assert.equal(await fallback, "connected");
+  assert.equal(await archive, "connected");
+  assert.deepEqual(await env.data.get("meta:archive.example.com:endpoints"), { apiBase: "https://api.example.test" });
 });
+

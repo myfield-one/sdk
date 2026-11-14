@@ -21,10 +21,11 @@ createInstance(options?: {
 `appId` defaults to the browser hostname. Use lowercase ASCII domain-form names,
 1–63 characters.
 
-`authUrl` selects the authorization environment, for example a dev Auth page. It must
-be an exact absolute HTTP(S) page URL; API addresses still come from the grant. Saved
-access from another `authUrl` is kept but not reused: `resume()` returns
-`"disconnected"` and `connect()` authorizes again.
+`authUrl` is the Auth page opened when authorization is needed, for example a dev page.
+It must be an exact absolute HTTP(S) page URL and applies to every bucket of the
+Instance. Only the API address returned by authorization is saved; saved access keeps
+using it after `authUrl` changes. To switch environments on one origin, use a separate
+`namespace` per environment, or call `disconnect()` before `connect()`.
 
 ## Buckets
 
@@ -182,7 +183,7 @@ shorthand for `setAutoSync()` followed by connecting.
 
 Bucket `resume`/`connect`/`disconnect` manage that bucket's own connection; use them for
 buckets from `createBucket()` and Instance methods for the default bucket.
-`bucket.connect` also accepts `autoSync` and `authBase`, the full authorization page URL.
+`bucket.connect` also accepts `autoSync`; set the Auth page with `createInstance({ authUrl })`.
 Invalid calls reject; authorization failures resolve `"disconnected"` and report the
 error through the state event.
 

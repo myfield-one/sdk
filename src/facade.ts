@@ -50,7 +50,6 @@ export type BucketState = "disconnected" | "connecting" | "connected";
 export type ListEntry = { id: string; updatedAt: string; deleted?: true };
 
 export type ConnectOptions = {
-  authBase?: string;
   autoSync?: boolean;
 };
 
@@ -585,7 +584,7 @@ function createBucketFacade(deps: BucketDeps) {
 
   // 0.9.1 semantics: invalid calls reject; authorization-flow failures resolve
   // "disconnected" after the state event carries the error.
-  async function connectLegacy(prompt: boolean, authBase?: string): Promise<BucketState> {
+  async function connectLegacy(prompt: boolean): Promise<BucketState> {
     if (disposed) throw new Error("disposed");
     await ensureClient();
     if (typeof window === "undefined") {
@@ -594,7 +593,7 @@ function createBucketFacade(deps: BucketDeps) {
     }
     let next: BucketState;
     try {
-      next = await (prompt ? connection.connectLegacy(authBase) : connection.resumeLegacy());
+      next = await (prompt ? connection.connect() : connection.resume());
     } catch (error) {
       if (error === lastFailure || isAbortError(error)) return "disconnected";
       throw error;
@@ -622,8 +621,11 @@ function createBucketFacade(deps: BucketDeps) {
     list,
     resume: () => connectLegacy(false),
     connect(options) {
+      if (options && typeof options === "object" && "authBase" in options) {
+        return Promise.reject(new ClientError("INVALID_INPUT", "Pass the authorization page as createInstance({ authUrl })"));
+      }
       if (options?.autoSync !== undefined) this.setAutoSync(options.autoSync);
-      return connectLegacy(true, options?.authBase || undefined);
+      return connectLegacy(true);
     },
     disconnect: () => connection.disconnect(),
     async sync() {

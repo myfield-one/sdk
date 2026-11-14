@@ -32,7 +32,6 @@ export type ListEntry = {
 };
 
 export type ConnectOptions = {
-  authBase?: string;
   autoSync?: boolean;
 };
 
