@@ -3,18 +3,10 @@
 Myfield SDK for third-party web apps: local-first object storage,
 end-to-end-encrypted sync, and internal Myfield authorization.
 
-The mental model: a bucket is a local-first **end-to-end-encrypted object KV
-with CAS-backed sync**. Local CRUD works with no account and no network;
-`connect()` is the single identity/network boundary. The cloud is a relay,
-not an archive — objects may be missing in cloud (old data rotates out),
-uploads may transiently fail (rate limits), and local storage is the source
-of truth.
+A bucket is a local-first **end-to-end-encrypted object KV with CAS-backed sync**.
+Local CRUD works without an account or network; `connect()` authorizes cloud access.
 
-Status: 1.0 preview. `0.9.0` reflects our assessment that the SDK design has
-reached its baseline shape; minor adjustments — including to the public API
-— are still possible before 1.0 based on community feedback and real-world
-use, and 1.0 will freeze the API/protocol, with later versions extending it
-while keeping compatibility. License: Apache-2.0.
+Status: pre-1.0 preview; public APIs may change before 1.0. License: Apache-2.0.
 
 ## Quickstart
 
@@ -24,14 +16,14 @@ import { createInstance } from "@myfield/sdk";
 const instance = createInstance("notes.example.com");
 const bucket = instance.getBucket();
 
-// On startup: resume an existing authorization / handle an auth callback.
-await instance.resume();
-
 // Local-first object CRUD works before authorization.
 await bucket.put("note:1", { title: "hello", body: "world" });
 const note = await bucket.get("note:1");
 await bucket.update("note:1", { body: undefined }); // deletes the field
 const entries = await bucket.list({ prefix: "note:" });
+
+// Restore access in the background after loading local data.
+void instance.resume().catch(error => console.error("Connection failed:", error));
 
 // On the user's "Connect" click: run the authorization flow (popup, or
 // same-tab on iOS).
@@ -53,27 +45,21 @@ and local storage, encrypting with `getBucketKey()`. See
   flow (popup / same-tab), callback decryption, bearer session refresh, and
   the unauthorized → disconnected transition. Apps use Instance
   `connect()` / `disconnect()` / state events only.
-- **Pairwise identity**: authorization is alias-only. Your app sees an alias
-  id for the user, never their global Myfield identity; different apps see
-  different aliases and cannot correlate users across apps.
+- **Pairwise identity**: apps receive app-specific aliases rather than the user's
+  primary Myfield identity.
 - **Encryption**: Local payloads are encrypted client-side; the platform stores
   ciphertext only. Object ids are blinded — your semantic ids
   (`note:1`, `note:list`) never reach the wire. Remote apps encrypt their own payloads.
-- **Merge**: objects are field maps with last-write-wins per field
-  (a state-based CRDT), so multi-device edits converge without conflicts
-  surfacing to the app. Custom merge strategies (e.g. Yjs documents) can be
-  plugged per object.
+- **Merge**: Local objects use last-write-wins per top-level field to merge
+  changes across devices.
 - **Sync triggers**: launch/resume, post-write debounce, and a timer
   fallback. Browser lifecycle triggers such as focus/visibility are app
   choices: call `bucket.sync()` from those handlers when that fits your UI.
 
 ## Honest boundaries
 
-- **The cloud is a sync relay, not a backup.** Free-tier data rotates
-  (oldest-first) under space pressure and after a retention window. Any
-  device holding the data re-uploads it automatically (self-healing), but if
-  every local copy is gone, rotated cloud data is not recoverable. Data
-  durability is owned by the app and the user.
+- **Recovery** depends on the cloud service's durability, retention and backup
+  guarantees, and on retaining access to decryption keys.
 - **Privacy boundary**: id blinding and encryption hide semantics, not
   traffic patterns — the platform still observes opaque-object write timing,
   sizes, and counts. Authorization revocation revokes access; it does not

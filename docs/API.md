@@ -119,9 +119,9 @@ Binary fields are inline in the same encrypted SDK object payload. They use the
 same field-level LWW ordering as other fields. The worker API is unchanged and
 continues to see only opaque encrypted object payloads.
 
-The SDK enforces a 100 MiB (`100 * 1024 * 1024` bytes) object-level encoded
-payload size cap. Apps requiring larger data should model chunks as separate objects; chunking is
-application-owned and is not a public SDK API concept.
+Upload limits depend on the service (currently up to 64 MiB for MyField).
+SDK-level large-file support is under consideration; apps currently handle
+splitting files across objects.
 
 ### Read And List
 
