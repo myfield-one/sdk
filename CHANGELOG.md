@@ -1,38 +1,24 @@
 # Changelog
 
-## 0.9.2-alpha.1 (unreleased)
+## 0.9.2
 
-- Add `remote.getBucketKey()`, returning the connected bucket ID, key ID and a
-  non-extractable `CryptoKey` for app-owned encryption.
-- Add `createInstance({ authUrl })` to choose the Auth page for every bucket of an
-  Instance. Saved access keeps the API address returned by authorization.
-- Fix `connect()` racing startup `resume()`, including custom authorization URLs and cancellation.
-- Unify Local and Remote connections, add `instance.getBucket()` and optional auto-sync
-  control on connect/resume. Keep manual sync available and validate legacy upload ACKs.
-- Breaking: `bucket.connect()` no longer accepts `authBase`; pass the full Auth page URL
-  as `createInstance({ authUrl })`. No API host is inferred; it comes from the grant.
-  A custom `authBase` saved by 0.9.1 is ignored: existing access keeps working, but the
-  next authorization opens `authUrl` or the default production Auth page.
-- Fixed Local sync marking a write synchronized when the server answered HTTP 200 with
-  `{ ok: false }`; unauthorized acknowledgements now invalidate access.
-- Automatic sync now follows connection state and `setAutoSync()` without requiring
-  `ready()` or prior Local operations. `bucket.ready()` is a deprecated no-op.
-- Sync error details keep the original retry information (`retryable`, `retryAfterMs`).
-- Add appId initialization and Instance key read/create/import/removal with nonextractable keys.
-  String initialization now means appId, which scopes identity and default storage;
-  namespace overrides storage scope.
-  Invalid identities remain intact for explicit recovery; Local objects are retained.
-- Separate instance key, proof and session internals; preserve APIs and stored records.
-  Derive instance IDs from public key material only.
-- Add Remote index/feed queries, paged version history, ancestry evidence and
-  change notifications.
-- Add Instance `resume()`, `connect()`, `disconnect()` and state events, plus
-  `instance.remote.getBucket()` for remote reads and CAS commits without Local sync.
-- Add `ClientError` and request cancellation. CAS rejection returns a result;
-  uncertain acknowledgements throw. Remote requests never retry automatically.
-- Accept lowercase domain-form appIds up to 63 characters.
-  Existing initialization, storage and formats remain compatible. Local and Remote
-  access to the same bucket require separate Instances.
+### Added
+- Unified Instance APIs for connection, state events and Local bucket access,
+  with optional automatic sync.
+- Remote APIs for object reads, CAS commits, version history and feed notifications,
+  including bucket-key access for app-managed encryption.
+- Instance key creation, retrieval, import and removal.
+
+### Fixed
+- Connection races during startup and incorrect upload-success handling.
+
+### Compatibility
+- String initialization now means `appId`; use `namespace` to preserve an existing
+  storage scope.
+- Configure authorization with `createInstance({ authUrl })` instead of
+  `bucket.connect({ authBase })`.
+- `bucket.ready()` is now a deprecated no-op. Existing stored keys and Local data
+  formats remain supported.
 
 ## 0.9.1
 
