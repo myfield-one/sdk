@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.3-alpha.0
+
+### Changed
+- Generate public declarations, API review reports and Markdown references from source.
+- Organize documentation into README, the existing API guide, generated API Reference and Specification.
+- Correct the documented existing binary payload framing; runtime APIs and formats are unchanged.
+
 ## 0.9.2
 
 ### Added

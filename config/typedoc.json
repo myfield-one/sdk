@@ -1,0 +1,24 @@
+{
+  "$schema": "https://typedoc-plugin-markdown.org/schema.json",
+  "entryPoints": [
+    "../src/index.ts"
+  ],
+  "tsconfig": "../tsconfig.api.json",
+  "plugin": [
+    "typedoc-plugin-markdown"
+  ],
+  "out": "../.api-build/docs",
+  "name": "@myfield/sdk",
+  "readme": "none",
+  "entryFileName": "index",
+  "router": "structure",
+  "hidePageHeader": true,
+  "disableSources": true,
+  "excludeInternal": true,
+  "parametersFormat": "table",
+  "typeAliasPropertiesFormat": "table",
+  "treatWarningsAsErrors": true,
+  "sort": [
+    "source-order"
+  ]
+}

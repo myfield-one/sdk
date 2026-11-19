@@ -1,10 +1,16 @@
-# @myfield/sdk API (v1 draft)
+# @myfield/sdk API (1.0 preview)
 
 `@myfield/sdk` exposes a local-first encrypted object bucket. Local reads and
 writes work without an account. `connect()` binds the bucket to Myfield auth and
 encrypted sync.
 
 For an overview, quickstart and service boundaries, see the [README](../README.md).
+
+## Documentation
+
+- [API Reference](api/index.md): generated public types, options and methods.
+- [Documentation overview](README.md).
+- [Bucket specification](spec/bucket.md): encoding, encryption and merge contracts.
 
 ## `createInstance`
 

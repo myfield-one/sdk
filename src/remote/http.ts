@@ -1,5 +1,8 @@
 import { ClientError } from "../errors.ts";
 
+/** Cancellation for a Remote operation; requests are not automatically retried.
+ * @public
+ */
 export type RequestOptions = { signal?: AbortSignal };
 export type RemoteRequest = (path: string, init?: RequestInit) => Promise<Response>;
 

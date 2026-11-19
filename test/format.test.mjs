@@ -148,7 +148,7 @@ test("opaque payload roundtrip", () => {
   assert.deepEqual(decoded.data, { any: ["shape", 1] });
 });
 
-// Unknown keys (BUCKET-SPEC merge steps 4-5) survive decode, merge and
+// Unknown keys (bucket spec, LWW-Map Merge) survive decode, merge and
 // re-encode, so a newer SDK's additions are not stripped by this one.
 test("unknown top-level keys and entry extras survive decode, merge and encode", () => {
   const withExtras = {

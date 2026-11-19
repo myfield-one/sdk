@@ -6,18 +6,23 @@ encrypted bucket format that SDK versions and compatible ports must reproduce
 to read the same local/cloud data. The worker stores ciphertext and validates
 transport shape; it does not interpret this plaintext format.
 
-App-facing API semantics live in `docs/API.md`.
+App-facing API semantics live in [api.md](../api.md).
 
 ## Payload
 
 Plaintext layout before encryption:
 
 ```text
-byte 0        format version (0x01)
-bytes 1..end  UTF-8 JSON body
+byte 0          format version (0x01)
+bytes 1..4      unsigned 32-bit big-endian JSON header byte length
+next bytes      UTF-8 JSON header
+remaining bytes repeated: uint32 big-endian part length, then raw part bytes
 ```
 
-Decoders reject unknown version bytes. Version 1 body is one of:
+Decoders reject unknown version bytes and invalid framing. Binary values use
+`binary-part-v1` descriptors with a zero-based `part` and matching byte `size`.
+All current writes use this framing, including objects without binary fields.
+The version 1 JSON header is one of:
 
 ```jsonc
 {

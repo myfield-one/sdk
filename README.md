@@ -6,7 +6,13 @@ end-to-end-encrypted sync, and internal MyField authorization.
 A bucket is a local-first **end-to-end-encrypted object KV with CAS-backed sync**.
 Local CRUD works without an account or network; `connect()` authorizes cloud access.
 
-Status: pre-1.0 preview; public APIs may change before 1.0. License: Apache-2.0.
+Status: 1.0 preview; public APIs may change during preview. License: Apache-2.0.
+
+## Install
+
+```sh
+npm install @myfield/sdk
+```
 
 ## Quickstart
 
@@ -30,14 +36,19 @@ void instance.resume().catch(error => console.error("Connection failed:", error)
 await instance.connect(); // defaults to https://myfield.one/auth/
 ```
 
-Full API reference: [`docs/API.md`](docs/API.md).
+## Documentation
+
+- [API guide](docs/api.md): Local/Remote usage and behavioral semantics.
+- [API Reference](docs/api/index.md): generated public types, options and methods.
+- [Specification](docs/spec/bucket.md): encoding, encryption, merge and compatibility.
+- [Documentation index](docs/README.md).
 
 ## Remote object access
 
 `instance.remote.getBucket()` provides object reads, CAS commits, version history and
 change notifications with the instance's authorization; the app owns payload encryption
 and local storage, encrypting with `getBucketKey()`. See
-[Remote Object API](docs/API.md#remote-object-api).
+[Remote Object API](docs/api.md#remote-object-api).
 
 ## What the SDK handles
 
@@ -87,19 +98,29 @@ implementation and tests, but are not exported package subpaths in v1.
 
 Compatible implementation details for SDK maintainers and future language
 ports (payload layout, merge rules, id derivation): see
-[`docs/BUCKET-SPEC.md`](./docs/BUCKET-SPEC.md).
+[Local bucket specification](docs/spec/bucket.md).
 
 ## Development
 
 This package has no runtime dependencies and uses a standalone pnpm lockfile.
+Use Node.js 24 in CI (minimum 22.18) and pnpm 9.15.0 for development.
 
 ```sh
-pnpm install
+pnpm install --frozen-lockfile
+npm run api:check
 npm run build
 npm test          # node --test (contract layer, mocked relay/auth)
 npm run typecheck # tsc --noEmit
-npm run typecheck:api # public declarations
+npm run typecheck:api # public declarations and documentation examples
+npm run test:docs
+npm run test:package
 MYFIELD_TEST_AUTH_URL="https://your-test-host/auth/" npm run verify:remote
 ```
 
 `verify:remote` is the SDK's standalone Remote API smoke check against a test service.
+
+Public declarations and API reference documentation are generated from source
+and TSDoc. After an intentional change, run `npm run api:update` and review
+`etc/sdk.api.md`, `types/` and `docs/api/`. Build and CI check these artifacts
+without accepting baseline changes; do not hand-edit generated files.
+API reports are review snapshots, not new release compatibility commitments.

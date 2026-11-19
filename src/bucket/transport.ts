@@ -25,6 +25,9 @@ export type TransportPushResult = { ok: true; versionId: string } | { ok: false;
 // Thrown by sync attempts while the app is not connected. Local reads and
 // writes never hit the transport, so local-first operation is unaffected;
 // sync resumes once a connection is established.
+/** The Local sync transport is unavailable.
+ * @public
+ */
 export class OfflineError extends Error {
   constructor() {
     super("not connected to cloud sync");

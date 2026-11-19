@@ -1,15 +1,7 @@
 import { ClientError } from "../errors.ts";
 import { sha256Hex, stableStringify } from "../internal/encoding.ts";
 
-export type AuthInstance = {
-  v: 1;
-  instanceId: string;
-  signingPublicJwk: JsonWebKey;
-  signingPrivateKey: CryptoKey;
-  wrappingPublicJwk: JsonWebKey;
-  wrappingPrivateKey: CryptoKey;
-  createdAt: string;
-};
+export type AuthInstance = InstanceKey & { v: 1 };
 
 export async function createInstanceKey(): Promise<AuthInstance> {
   const signing = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign", "verify"]);
@@ -38,7 +30,17 @@ export async function deriveInstanceId(signingPublicJwk: JsonWebKey): Promise<st
   return `inst_${digest.slice(0, 32)}`;
 }
 
-export type InstanceKey = Omit<AuthInstance, "v">;
+/** Persisted instance identity with public JWKs and non-extractable private CryptoKeys.
+ * @public
+ */
+export type InstanceKey = {
+  instanceId: string;
+  signingPublicJwk: JsonWebKey;
+  signingPrivateKey: CryptoKey;
+  wrappingPublicJwk: JsonWebKey;
+  wrappingPrivateKey: CryptoKey;
+  createdAt: string;
+};
 
 export function toInstanceKey(value: AuthInstance): InstanceKey {
   return { instanceId: value.instanceId, signingPublicJwk: { ...value.signingPublicJwk },

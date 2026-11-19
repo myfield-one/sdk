@@ -1,4 +1,4 @@
-// Executable specification for the §6 public facade (docs/API.md).
+// Executable specification for the §6 public facade (docs/api.md).
 //
 // This file is wired into `npm test` and is the reviewable contract for the
 // facade. Assertion changes mean the contract moved and need a doc/plan

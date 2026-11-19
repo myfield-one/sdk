@@ -1,6 +1,6 @@
 {
   "name": "@myfield/sdk",
-  "version": "0.9.2",
+  "version": "0.9.3-alpha.0",
   "description": "MyField SDK for third-party web apps: local-first object storage, end-to-end-encrypted sync, and internal MyField authorization.",
   "license": "Apache-2.0",
   "author": "OPENTECH AI PTE. LTD.",
@@ -44,17 +44,27 @@
   ],
   "sideEffects": false,
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=dist/index.js",
+    "build": "npm run build:js && node scripts/api.mjs --build",
     "prepack": "npm run build",
     "test": "node --experimental-strip-types --test test/*.test.mjs",
     "verify:remote": "node scripts/verify-remote.mjs",
     "typecheck": "tsc --noEmit",
-    "typecheck:api": "tsc --noEmit --strict --allowImportingTsExtensions --module NodeNext --moduleResolution NodeNext --target ES2022 test/remote-consumer.ts"
+    "typecheck:api": "node scripts/verify-docs.mjs && tsc -p tsconfig.consumer.json",
+    "build:js": "esbuild src/index.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=dist/index.js",
+    "api:update": "node scripts/api.mjs --update",
+    "api:check": "node scripts/api.mjs",
+    "test:package": "node scripts/verify-package.mjs",
+    "test:docs": "node scripts/verify-docs.mjs",
+    "test:tooling": "node --test test/api-generation.test.mjs"
   },
   "devDependencies": {
     "@types/node": "^25.5.2",
     "esbuild": "^0.28.1",
     "fake-indexeddb": "6.2.4",
-    "typescript": "5.5.4"
-  }
+    "typescript": "5.5.4",
+    "@microsoft/api-extractor": "7.59.4",
+    "typedoc": "0.28.20",
+    "typedoc-plugin-markdown": "4.14.1"
+  },
+  "packageManager": "pnpm@9.15.0"
 }
