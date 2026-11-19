@@ -6,7 +6,7 @@
 // Document body:
 //   { t: "lww-map", fields: { name: { v, ts, actor } }, tombstones: { name: { ts, actor } } }
 //   or { t: "opaque", data: <arbitrary JSON> } for custom merge strategies.
-// Unknown top-level and entry keys are kept (BUCKET-SPEC merge steps 4-5).
+// Unknown top-level and entry keys are kept (bucket spec, LWW-Map Merge).
 // Binary typed field values are represented in the JSON header as part references
 // and carried as raw bytes in the binary parts section.
 

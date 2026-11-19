@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": false,
+    "allowImportingTsExtensions": true
+  },
+  "include": [
+    "test/remote-consumer.ts",
+    "test/api-consumer.ts",
+    "test/public-api-compatibility.ts"
+  ]
+}

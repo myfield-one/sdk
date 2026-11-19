@@ -1,4 +1,4 @@
-// Public facade (docs/API.md): createInstance / Instance / Bucket.
+// Public facade (docs/api.md): createInstance / Instance / Bucket.
 //
 // A bucket is a local-first end-to-end-encrypted object KV. Local CRUD works
 // with no account and no network; connect() is the single network/identity
@@ -6,7 +6,7 @@
 // context, sessions, objects, the internal index) and never reaches the
 // wire; bucket `id` is the app-local authorization label, while sync uses
 // the remote bucket id returned in the grant envelope. `~index` is local
-// only; objects carry their app id in `~id` (docs/BUCKET-SPEC.md).
+// only; objects carry their app id in `~id` (docs/spec/bucket.md).
 
 import { BucketClient, type BucketTransportLike, type ChangeSource } from "./bucket/client.ts";
 import type { PayloadDoc } from "./bucket/format.ts";
@@ -38,66 +38,123 @@ const ID_FIELD = "~id";
 const DELETED_FIELD = "~deleted";
 const RESERVED_PREFIX = "~";
 
+/** Local persistence scope and authorization page settings. Creating an Instance does not connect.
+ * @public
+ */
 export type CreateInstanceOptions = {
+  /** Existing local storage scope; defaults to explicit appId, otherwise "default". */
   namespace?: string;
+  /** IndexedDB by default; memory is useful for tests and ephemeral clients. */
   storage?: "indexeddb" | "memory";
+  /** Stable lowercase domain-form application ID; defaults to the browser hostname. */
   appId?: string;
+  /** Absolute HTTP(S) Auth page URL without credentials, query or fragment. */
   authUrl?: string;
 };
 
+/** Connection state shared with the associated resource.
+ * @public
+ */
 export type BucketState = "disconnected" | "connecting" | "connected";
 
+/** Known local object ID and UTC ISO update time; deleted entries are opt-in.
+ * @public
+ */
 export type ListEntry = { id: string; updatedAt: string; deleted?: true };
 
+/** Automatic Local synchronization settings; defaults to enabled.
+ * @public
+ */
 export type ConnectOptions = {
+  /** Enable automatic Local sync after connecting; defaults to true. */
   autoSync?: boolean;
 };
 
 export type { BinaryInput, BinaryOptions, BucketBinaryValue };
 
+/** Local-first object storage. Network synchronization requires a connection.
+ * @public
+ */
 export type Bucket = {
+  /** The local resource label; the granted remote bucket ID may differ. */
   readonly id: string;
+  /** Current connection state. */
   readonly state: BucketState;
+  /** Wraps a binary field without uploading it. */
   binary(input: BinaryInput | BucketBinaryValue, options?: BinaryOptions): BucketBinaryValue;
   /** @deprecated No-op kept for compatibility; operations initialize storage lazily. */
   ready(): Promise<void>;
+  /** Replaces known local fields; concurrent unknown remote fields remain mergeable. */
   put(objectId: string, object: Record<string, unknown>): Promise<void>;
+  /** Reads local data, returning null for absent or deleted objects. */
   get(objectId: string): Promise<Record<string, unknown> | null>;
+  /** Updates top-level fields; undefined deletes a field. */
   update(objectId: string, fields: Record<string, unknown>): Promise<void>;
+  /** Creates a local deletion and schedules synchronization when connected. */
   delete(objectId: string): Promise<void>;
+  /** Lists known local objects newest first; does not query the cloud. */
   list(options?: { prefix?: string; includeDeleted?: boolean }): Promise<ListEntry[]>;
+  /** Restores saved authorization without prompting. Load local data first. */
   resume(): Promise<BucketState>;
+  /** Connects from a user gesture; authorization failures report disconnected state. */
   connect(options?: ConnectOptions): Promise<BucketState>;
+  /** Drops authorization and connection while retaining local objects and identity keys. */
   disconnect(): Promise<void>;
+  /** Runs one Local sync pass; rejects when disconnected. */
   sync(): Promise<void>;
+  /** Enables or disables automatic Local sync; an active pass may finish. */
   setAutoSync(enabled: boolean): void;
+  /** Subscribes to state or local changes; returns an unsubscribe function. */
   on(event: "state", handler: (state: BucketState, detail?: string) => void): () => void;
+  /** Subscribes to state or local changes; returns an unsubscribe function. */
   on(event: "change", handler: (objectId: string) => void): () => void;
+  /** Stops this bucket runtime and releases listeners and sync resources. */
   dispose(): void;
-  // Internal test seam: binds a transport as if connect() succeeded, with
-  // identity wire ids (blinding has its own unit tests). Not public API.
+  /** @internal */
   __bindTestTransport(transport: BucketTransportLike): void;
 };
 
+/** Application identity, authorization and access to Local and Remote buckets.
+ * @public
+ */
 export type Instance = {
+  /** Local persistence namespace; never sent as the remote bucket ID. */
   readonly namespace: string;
+  /** Remote access for the default bucket; the app owns encryption and local storage. */
   readonly remote: { getBucket(): RemoteBucket };
+  /** Current connection state. */
   readonly state: BucketState;
+  /** Returns the cached default Local bucket identified by appId. */
   getBucket(): Bucket;
+  /** Reads the saved instance identity, or null when absent. */
   getKey(): Promise<InstanceKey | null>;
+  /** Creates an identity when disconnected; rejects if a key already exists. */
   createKey(): Promise<InstanceKey>;
+  /** Validates and saves an identity when disconnected; does not import grants. */
   importKey(key: InstanceKey): Promise<void>;
+  /** Removes the identity and dependent authorization when disconnected. */
   removeKey(): Promise<void>;
+  /** Restores saved authorization without prompting. Load local data first. */
   resume(options?: { autoSync?: boolean }): Promise<BucketState>;
+  /** Connects from a user gesture; authorization failures report disconnected state. */
   connect(options?: { autoSync?: boolean }): Promise<BucketState>;
+  /** Drops authorization and connection while retaining local objects and identity keys. */
   disconnect(): Promise<void>;
+  /** Subscribes to connection state and error notifications; returns an unsubscribe function. */
   on(event: "state", handler: (state: BucketState, error?: ClientError) => void): () => void;
+  /** Gets a Local handle for another stable resource label; creation is local-only. */
   createBucket(options: { id: string }): Bucket;
 };
 
 export const instanceTestCleanup = new WeakMap<Instance, () => void>();
 
+/** Creates a local Instance with an explicit application ID. No network I/O.
+ * @public
+ */
 export function createInstance(appId: string): Instance;
+/** Creates a local Instance; appId defaults to the browser hostname.
+ * @public
+ */
 export function createInstance(options?: CreateInstanceOptions): Instance;
 export function createInstance(input: string | CreateInstanceOptions = {}, ...extra: unknown[]): Instance {
   if (typeof input === "string" && extra.length) throw new ClientError("INVALID_INPUT", "createInstance accepts an appId or an options object, without additional arguments");
@@ -351,7 +408,7 @@ function createBucketFacade(deps: BucketDeps) {
   }
 
   // Fields whose JSON value is unchanged keep their existing LWW
-  // timestamp/source (API.md): re-stamping unchanged fields would let a
+  // timestamp/source (api.md): re-stamping unchanged fields would let a
   // device that re-saves whole objects steamroll other devices' concurrent
   // field edits.
   async function dropUnchanged(updates: Record<string, unknown>, known: Record<string, unknown>): Promise<Record<string, unknown>> {

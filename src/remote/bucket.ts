@@ -4,14 +4,24 @@ import { invalidResponse, readJson, isRecord, requireString, type RemoteRequest,
 import { openFeedStream, isFeedHint, type FeedHint } from "./feed.ts";
 export type { FeedHint } from "./feed.ts";
 
+/** Transport metadata. Application plaintext and private metadata must remain encrypted.
+ * @public
+ */
 export type VersionMeta = {
+  /** App-supplied Remote object ID; Remote does not apply Local ID blinding. */
   objectId: string;
+  /** Fixed version identity; reuse it with the same bytes after an uncertain outcome. */
   versionId: string;
+  /** Direct parents; include the expected CAS head for an update. */
   parentVersionIds: string[];
+  /** SHA-256 of the submitted ciphertext bytes when supplied. */
   payloadHash?: string;
   [field: string]: unknown;
 };
 
+/** The current committed version, with optional newest-first ancestry evidence.
+ * @public
+ */
 export type CurrentVersion = {
   versionId: string;
   headVersionMeta: VersionMeta;
@@ -19,26 +29,69 @@ export type CurrentVersion = {
   [field: string]: unknown;
 };
 
+/** Version metadata and its payload. Consume or cancel Response bodies.
+ * @public
+ */
 export type ObjectVersion<TPayload = Response> = { meta: VersionMeta; payload: TPayload };
-export type CommitInput = { meta: VersionMeta; payload: Blob | Uint8Array; expectedHeadVersionId: string | null };
+/** App-encrypted bytes and metadata submitted against an expected remote head.
+ * @public
+ */
+export type CommitInput = {
+  meta: VersionMeta;
+  /** App-encrypted payload; never submit private plaintext. */
+  payload: Blob | Uint8Array;
+  /** Last observed head, or null to create an object. */
+  expectedHeadVersionId: string | null;
+};
+/** A successful commit or a CAS rejection; other failures throw ClientError.
+ * @public
+ */
 export type CommitResult = { ok: true } | { ok: false; reason: "version-mismatch" | "conflict" };
+/** Opaque pagination cursor, optional positive page limit and cancellation.
+ * @public
+ */
 export type PageOptions = RequestOptions & { cursor?: string | null; limit?: number };
+/** Committed-version metadata with ancestry and an opaque continuation cursor.
+ * @public
+ */
 export type VersionHistory = VersionMeta & { history: string[]; nextCursor: string | null };
+/** One page of changes. Continue from cursor while hasMore is true.
+ * @public
+ */
 export type FeedPage = { entries: FeedHint[]; cursor: string; hasMore: boolean; [field: string]: unknown };
+/** Current object heads and the starting cursor for feed catch-up.
+ * @public
+ */
 export type BucketIndex = { bucketId: string; objects: FeedHint[]; feedCursor: string | null; hasMoreFeed: boolean; [field: string]: unknown };
 
+/** The granted non-extractable AES-GCM key and remote bucket identity for app encryption.
+ * @public
+ */
 export type BucketKey = { bucketId: string; keyId: string; cryptoKey: CryptoKey };
 
+/** Storage-independent Remote operations. The application owns payload encryption, merge and recovery.
+ * @public
+ */
 export interface RemoteBucket {
+  /** Returns the granted key handle without a request. Use your own AAD and retain keyId. */
   getBucketKey(options?: RequestOptions): Promise<BucketKey>;
+  /** Reads the current head, or null when absent. knownVersionId requests ancestry evidence. */
   getCurrent(objectId: string, options?: RequestOptions & { knownVersionId?: string | null }): Promise<CurrentVersion | null>;
+  /** Reads metadata and a payload Response; consume or cancel its body. */
   getVersion(objectId: string, versionId: string, options?: RequestOptions): Promise<ObjectVersion>;
+  /** Reads metadata for one committed version; missing versions throw. */
   getVersionMeta(objectId: string, versionId: string, options?: RequestOptions): Promise<VersionMeta>;
+  /** Returns the encrypted payload Response; consume or cancel its body. */
   getPayload(objectId: string, versionId: string, options?: RequestOptions): Promise<Response>;
+  /** Submits encrypted bytes with CAS. Preserve IDs and bytes after uncertain failures. */
   commit(input: CommitInput, options?: RequestOptions): Promise<CommitResult>;
+  /** Reads committed-version history anchored at one object/version; follow nextCursor. */
   listVersions(objectId: string, versionId: string, options?: PageOptions): Promise<VersionHistory>;
+  /** Reads the current heads snapshot and its feed catch-up cursor. */
   getIndex(options?: RequestOptions): Promise<BucketIndex>;
+  /** Reads a feed page; continue from cursor while hasMore is true. */
   listFeed(options?: PageOptions): Promise<FeedPage>;
+  /** Awaits subscription readiness and yields hints. Catch up after subscribing; no automatic reconnect. */
   watchFeed(options?: RequestOptions): Promise<AsyncGenerator<FeedHint>>;
 }
 

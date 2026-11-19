@@ -3,7 +3,7 @@ import {
   type CreateInstanceOptions, type RemoteBucket, type CurrentVersion, type VersionMeta,
   type PageOptions, type VersionHistory, type FeedHint, type FeedPage, type BucketIndex,
   type ObjectVersion, type CommitInput, type CommitResult, type RequestOptions, type ClientErrorOptions, type BucketKey,
-} from "../types/index.js";
+} from "@myfield/sdk";
 import type * as Source from "../src/index.ts";
 
 type Same<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false;
@@ -78,9 +78,9 @@ await bucket.ready(); await bucket.put("note", { text: "existing" });
 bucket.on("state", state => console.log(state));
 
 const imported = createInstance({ appId: "card.example.com", namespace: "default" });
-const existingKey = null! as import("../types/index.js").InstanceKey;
-const savedKey: import("../types/index.js").InstanceKey | null = await imported.getKey();
-const createdKey: import("../types/index.js").InstanceKey = await imported.createKey();
+const existingKey = null! as import("@myfield/sdk").InstanceKey;
+const savedKey: import("@myfield/sdk").InstanceKey | null = await imported.getKey();
+const createdKey: import("@myfield/sdk").InstanceKey = await imported.createKey();
 void savedKey; void createdKey;
 await imported.removeKey();
 await imported.importKey(existingKey);

@@ -1,6 +1,9 @@
 import { ClientError } from "../errors.ts";
 import { invalidResponse, isRecord } from "./http.ts";
 
+/** An object/version notification that prompts feed catch-up, not an object payload.
+ * @public
+ */
 export type FeedHint = { objectId: string; versionId: string };
 
 export function isFeedHint(value: unknown): value is FeedHint {
