@@ -1009,7 +1009,8 @@ test("getKey and createKey preserve nonextractable identity across reload withou
   assert.equal(key.signingPrivateKey.extractable, false);
   assert.equal(key.wrappingPrivateKey.extractable, false);
   assert.equal("v" in key, false); assert.equal("updatedAt" in key, false);
-  await assert.rejects(crypto.subtle.exportKey("jwk", key.signingPrivateKey), { name: "InvalidAccessException" });
+  await assert.rejects(crypto.subtle.exportKey("jwk", key.signingPrivateKey), error =>
+    error instanceof DOMException && ["InvalidAccessError", "InvalidAccessException"].includes(error.name));
   await assert.rejects(instance.createKey(), code("KEY_EXISTS"));
   const snapshot = await instance.getKey();
   snapshot.signingPublicJwk.x = "changed";
