@@ -1,7 +1,7 @@
 # @myfield/sdk
 
-Myfield SDK for third-party web apps: local-first object storage,
-end-to-end-encrypted sync, and internal Myfield authorization.
+MyField SDK for third-party web apps: local-first object storage,
+end-to-end-encrypted sync, and internal MyField authorization.
 
 A bucket is a local-first **end-to-end-encrypted object KV with CAS-backed sync**.
 Local CRUD works without an account or network; `connect()` authorizes cloud access.
