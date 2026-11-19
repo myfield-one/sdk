@@ -1,7 +1,7 @@
 {
   "name": "@myfield/sdk",
   "version": "0.9.2",
-  "description": "Myfield open SDK: instance auth and end-to-end-encrypted bucket sync for third-party web apps.",
+  "description": "MyField SDK for third-party web apps: local-first object storage, end-to-end-encrypted sync, and internal MyField authorization.",
   "license": "Apache-2.0",
   "author": "OPENTECH AI PTE. LTD.",
   "homepage": "https://github.com/myfield-one/sdk",
