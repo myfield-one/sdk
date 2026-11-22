@@ -57,7 +57,7 @@ and local storage, encrypting with `getBucketKey()`. See
   the unauthorized → disconnected transition. Apps use Instance
   `connect()` / `disconnect()` / state events only.
 - **Pairwise identity**: apps receive app-specific aliases rather than the user's
-  primary Myfield identity.
+  primary MyField identity.
 - **Encryption**: Local payloads are encrypted client-side; the platform stores
   ciphertext only. Object ids are blinded — your semantic ids
   (`note:1`, `note:list`) never reach the wire. Remote apps encrypt their own payloads.
