@@ -1,7 +1,7 @@
 # @myfield/sdk API (1.0 preview)
 
 `@myfield/sdk` exposes a local-first encrypted object bucket. Local reads and
-writes work without an account. `connect()` binds the bucket to Myfield auth and
+writes work without an account. `connect()` binds the bucket to MyField auth and
 encrypted sync.
 
 For an overview, quickstart and service boundaries, see the [README](../README.md).
@@ -45,7 +45,7 @@ instance.createBucket(options: { id: string }): Bucket;
 - `createBucket()` remains available for other buckets. Use a stable domain-shaped id, usually the app host, for
   example `"app.example.com"`.
 - Creating a bucket is local-only: no network and no account.
-- The local bucket id is the user-facing resource label. Myfield may bind it to
+- The local bucket id is the user-facing resource label. MyField may bind it to
   a different remote bucket id during `connect()`; apps must not assume they
   are the same.
 - Valid ids use lowercase `a-z0-9`, `.`, and `-`, max 63 chars.
